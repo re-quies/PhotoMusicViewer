@@ -1,0 +1,14 @@
+<Window x:Class="PhotoMusicViewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ФотоМузыка" Height="900" Width="1500"
+        Background="{StaticResource BackgroundBrush}"
+        WindowStartupLocation="CenterScreen"
+        AllowDrop="True"
+        PreviewDragOver="Window_PreviewDragOver"
+        Drop="Window_Drop">
+
+    <Grid>
+        <ContentControl x:Name="ModeContent"/>
+    </Grid>
+</Window>

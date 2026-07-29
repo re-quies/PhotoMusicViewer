@@ -1,0 +1,199 @@
+<UserControl x:Class="PhotoMusicViewer.Views.MusicView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="{StaticResource BackgroundBrush}"
+             Focusable="True"
+             KeyboardNavigation.DirectionalNavigation="None"
+             PreviewKeyDown="MusicView_PreviewKeyDown"
+             PreviewMouseDown="MusicView_PreviewMouseDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Список треков -->
+        <ListBox x:Name="TrackListBox" Grid.Row="0"
+         Background="{StaticResource BackgroundBrush}"
+         Foreground="{StaticResource ForegroundBrush}"
+         BorderThickness="0"
+         AllowDrop="True"
+         DragEnter="TrackListBox_DragEnter"
+         Drop="TrackListBox_Drop"
+         PreviewMouseLeftButtonDown="TrackListBox_PreviewMouseLeftButtonDown"
+         PreviewMouseLeftButtonUp="TrackListBox_PreviewMouseLeftButtonUp"
+         MouseMove="TrackListBox_MouseMove"
+         MouseDoubleClick="TrackListBox_MouseDoubleClick">
+            <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                    <Setter Property="Padding" Value="10,8"/>
+                    <Setter Property="Background" Value="Transparent"/>
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                    <Style.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter Property="Background" Value="{StaticResource ButtonHoverBrush}"/>
+                        </Trigger>
+                    </Style.Triggers>
+                </Style>
+            </ListBox.ItemContainerStyle>
+            <!-- Клик по названию - переименование; пустое место правее - перетаскивание/выбор -->
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Grid Background="Transparent">
+                        <TextBlock x:Name="TrackTitleText" HorizontalAlignment="Left" VerticalAlignment="Center"
+                                   Text="{Binding DisplayName}" Cursor="IBeam"
+                                   MouseLeftButtonDown="TrackTitle_MouseLeftButtonDown"/>
+                        <TextBox x:Name="TrackEditBox" HorizontalAlignment="Left" VerticalAlignment="Center"
+                                 MinWidth="160" Visibility="Collapsed" BorderThickness="0" Padding="0"
+                                 Background="Transparent" Foreground="{StaticResource ForegroundBrush}"
+                                 CaretBrush="{StaticResource ForegroundBrush}"
+                                 LostFocus="TrackEditBox_LostFocus"
+                                 PreviewKeyDown="TrackEditBox_PreviewKeyDown"/>
+                    </Grid>
+                    <DataTemplate.Triggers>
+                        <DataTrigger Binding="{Binding IsEditing}" Value="True">
+                            <Setter TargetName="TrackTitleText" Property="Visibility" Value="Collapsed"/>
+                            <Setter TargetName="TrackEditBox" Property="Visibility" Value="Visible"/>
+                        </DataTrigger>
+                    </DataTemplate.Triggers>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <!-- Панель воспроизведения -->
+        <Grid Grid.Row="1" Background="{StaticResource PanelBrush}" Margin="0,1,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Slider x:Name="SeekSlider" Grid.Row="0" Margin="10,6,10,0"
+                    Minimum="0" Maximum="1" Value="0"
+                    PreviewMouseLeftButtonUp="SeekSlider_PreviewMouseLeftButtonUp"
+                    PreviewMouseLeftButtonDown="SeekSlider_PreviewMouseLeftButtonDown"
+                    PreviewMouseMove="SeekSlider_PreviewMouseMove"/>
+
+            <Grid Grid.Row="1" Margin="10,0,10,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock x:Name="TimeText" Grid.Column="0" VerticalAlignment="Center"
+                           Foreground="{StaticResource ForegroundBrush}" Text="00:00 / 00:00"/>
+
+                <!-- Название текущего трека (переименование - в плейлисте, кликом по названию) -->
+                <TextBlock x:Name="NowPlayingText" Grid.Column="1" Margin="10,0"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Foreground="{StaticResource ForegroundBrush}"
+                           Text="No track loaded" TextTrimming="CharacterEllipsis"/>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <!-- Скорость воспроизведения: клик по тексту сбрасывает на 1.0x -->
+                    <TextBlock x:Name="SpeedLabel" Text="Speed" Foreground="{StaticResource ForegroundBrush}"
+                               VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <Slider x:Name="SpeedSlider" Width="90" Minimum="0.1" Maximum="3" Value="1"
+                            TickFrequency="0.1" IsSnapToTickEnabled="True"
+                            VerticalAlignment="Center" ValueChanged="SpeedSlider_ValueChanged"
+                            PreviewMouseLeftButtonDown="SpeedSlider_PreviewMouseLeftButtonDown"
+                            PreviewMouseMove="SpeedSlider_PreviewMouseMove"
+                            PreviewMouseLeftButtonUp="SpeedSlider_PreviewMouseLeftButtonUp"
+                            PreviewMouseWheel="SpeedSlider_PreviewMouseWheel"/>
+                    <TextBlock x:Name="SpeedText" Text="1.0x" MinWidth="34"
+                               Foreground="{StaticResource ForegroundBrush}"
+                               VerticalAlignment="Center" Margin="6,0,12,0"
+                               Cursor="Hand" ToolTip="Click to reset speed to 1.0x"
+                               MouseLeftButtonDown="SpeedText_MouseLeftButtonDown"/>
+
+                    <TextBlock x:Name="VolLabel" Text="Vol" Foreground="{StaticResource ForegroundBrush}"
+                               VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <Slider x:Name="VolumeSlider" Width="90" Minimum="0" Maximum="1" Value="0.8"
+                            VerticalAlignment="Center" ValueChanged="VolumeSlider_ValueChanged"
+                            PreviewMouseLeftButtonDown="VolumeSlider_PreviewMouseLeftButtonDown"
+                            PreviewMouseMove="VolumeSlider_PreviewMouseMove"
+                            PreviewMouseLeftButtonUp="VolumeSlider_PreviewMouseLeftButtonUp"
+                            PreviewMouseWheel="VolumeSlider_PreviewMouseWheel"/>
+                    <TextBlock x:Name="VolumePercentText" Text="80%" MinWidth="34"
+                               Foreground="{StaticResource ForegroundBrush}"
+                               VerticalAlignment="Center" Margin="6,0,0,0"/>
+                </StackPanel>
+            </Grid>
+        </Grid>
+
+        <!-- Нижняя панель управления -->
+        <Grid Grid.Row="2" Background="{StaticResource PanelBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <ToggleButton x:Name="PhotoModeToggleBtn" Content="Photo" Width="70" Grid.Column="0"
+                          Margin="4,4" Click="PhotoModeToggleBtn_Click"
+                          Focusable="False" IsTabStop="False"/>
+            <ToggleButton x:Name="MusicModeToggleBtn" Content="Music" Width="70" Grid.Column="1"
+                          IsChecked="True" Margin="4,4" Click="MusicModeToggleBtn_Click"
+                          Focusable="False" IsTabStop="False"/>
+
+            <TextBlock x:Name="TrackCountText" Grid.Column="2" VerticalAlignment="Center"
+                       Margin="10,0" Opacity="0.6" Text=""
+                       Foreground="{StaticResource ForegroundBrush}"/>
+
+            <StackPanel Grid.Column="3" Orientation="Horizontal">
+                <Button x:Name="AddFolderButton" Content="Add Folder" Margin="4,4"
+                        Click="AddFolderButton_Click" Focusable="False" IsTabStop="False"/>
+                <!-- Кнопка открывает страницу GitHub разработчика.
+                     Ссылка задаётся в MusicView.xaml.cs -> DeveloperGitHubUrl -->
+                <Button x:Name="GitHubButton" Content="GitHub" Margin="4,4"
+                        ToolTip="Open the developer's GitHub page"
+                        Click="GitHubButton_Click" Focusable="False" IsTabStop="False"/>
+            </StackPanel>
+
+            <ComboBox x:Name="SortModeCombo" Grid.Column="4" Width="110" Margin="4,4"
+                      SelectedIndex="0" SelectionChanged="SortModeCombo_SelectionChanged"
+                      Focusable="False" IsTabStop="False">
+                <ComboBoxItem Content="Name"/>
+                <ComboBoxItem Content="Date modified"/>
+                <ComboBoxItem Content="Size"/>
+                <ComboBoxItem Content="Type"/>
+            </ComboBox>
+            <Button x:Name="SortDirectionButton" Grid.Column="5" Content="&#8593;" Width="30" Margin="4,4"
+                    Click="SortDirectionButton_Click" Focusable="False" IsTabStop="False"/>
+
+            <Button x:Name="ShuffleButton" Grid.Column="6" Content="Shuffle" Margin="4,4"
+                    Click="ShuffleButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="RepeatButton" Grid.Column="7" Content="Repeat: Off" Margin="4,4"
+                    Click="RepeatButton_Click" Focusable="False" IsTabStop="False"/>
+
+            <Button x:Name="PrevTrackButton" Grid.Column="8" Content="&#9198;" Width="40" Margin="4,4"
+                    FontSize="16" Click="PrevTrackButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="PlayPauseButton" Grid.Column="9" Content="&#9654;" Width="40" Margin="4,4"
+                    FontSize="16" Click="PlayPauseButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="NextTrackButton" Grid.Column="10" Content="&#9197;" Width="40" Margin="4,4"
+                    FontSize="16" Click="NextTrackButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="RemoveTrackButton" Grid.Column="11" Content="Remove" Margin="4,4"
+                    Click="RemoveTrackButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="ClearButton" Grid.Column="12" Content="Clear" Margin="4,4"
+                    Click="ClearButton_Click" Focusable="False" IsTabStop="False"/>
+            <Button x:Name="LangButton" Grid.Column="13" Content="EN" Width="40" Margin="4,4"
+                    ToolTip="Switch language / Переключить язык / Cambiar idioma"
+                    Click="LangButton_Click" Focusable="False" IsTabStop="False"/>
+        </Grid>
+    </Grid>
+</UserControl>
