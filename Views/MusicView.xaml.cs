@@ -502,7 +502,7 @@ namespace PhotoMusicViewer.Views
 
         // --- Локализация (EN/RU) ---
 
-        private const string DeveloperGitHubUrl = "https://github.com/re-quies/fastcollageforwin";
+        private const string DeveloperGitHubUrl = "https://github.com/re-quies/PhotoMusicViewer";
 
         private void GitHubButton_Click(object sender, RoutedEventArgs e) => OpenDeveloperGitHub();
 
