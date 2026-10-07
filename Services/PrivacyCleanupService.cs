@@ -28,9 +28,10 @@ namespace PhotoMusicViewer.Services
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // Не критично - если не получилось убрать запись, просто оставляем как есть, без окон
+                AppLog.Debug("PrivacyCleanupService.RemoveRecentEntry", ex);
             }
         }
     }

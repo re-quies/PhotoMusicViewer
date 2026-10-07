@@ -80,9 +80,10 @@ public void Load(string path)
                     ? new OpusFileReader(path)
                     : new VorbisWaveReader(path);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
                 // Не Ogg Vorbis — пробуем как Ogg Opus
+                AppLog.Debug("AudioPlayerService.OpenVorbis → Opus", ex);
                 _naudioReader = new OpusFileReader(path);
             }
 
@@ -120,6 +121,7 @@ public void Load(string path)
     }
     catch (Exception ex)
     {
+        AppLog.Error("AudioPlayerService.Load", ex, AppLog.Describe(path));
         PlaybackError?.Invoke(Loc.T("Failed to load", "Не удалось загрузить", "No se pudo cargar") + $" '{System.IO.Path.GetFileName(path)}': {ex}");
     }
 }
@@ -154,6 +156,7 @@ public void Load(string path)
     }
     catch (Exception ex)
     {
+        AppLog.Error("AudioPlayerService.Play", ex);
         PlaybackError?.Invoke(Loc.T("Failed to start playback", "Не удалось начать воспроизведение", "No se pudo iniciar la reproducción") + $": {ex}");
     }
 }

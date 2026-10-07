@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using Concentus.Oggfile;
@@ -16,6 +17,11 @@ namespace PhotoMusicViewer.Services
     /// Length/TotalTime растут, пока фоновое декодирование не закончится
     /// (обычно это секунды — декодер многократно быстрее реального времени).
     ///
+    /// Память: PCM хранится цепочкой блоков по ChunkBytes, а не одним растущим
+    /// массивом. Раньше буфер удваивался через Array.Resize: каждое расширение
+    /// копировало всё уже декодированное и на пике требовало два буфера сразу,
+    /// а до половины выделенной памяти оставалось неиспользованной.
+    ///
     /// Буфер ограничен потолком MaxPcmBytes (~2.9 часа звука): более длинные
     /// записи загружаются частично, о чём сообщает событие Truncated.
     /// </summary>
@@ -28,11 +34,14 @@ namespace PhotoMusicViewer.Services
         private readonly OpusOggReadStream _oggStream;
 
         // Потолок буфера декодированного PCM (~2 ГБ = ~2.9 часа при 48кГц/16бит/стерео).
-        // Больше в byte[] всё равно не помещается; раньше превышение обрывало
-        // декодирование молча (исключением), теперь остановка явная - см. Truncated.
+        // Превышение останавливает декодирование явно - см. Truncated.
         private const long MaxPcmBytes = 2_000_000_000;
 
-        private byte[] _pcmData = new byte[1 << 20]; // растущий буфер декодированного PCM
+        // Размер одного блока буфера. Должен быть чётным: тогда сэмпл (2 байта)
+        // никогда не разрывается между блоками.
+        private const int ChunkBytes = 4 << 20;   // 4 МБ
+
+        private readonly List<byte[]> _chunks = new();
         private long _decodedBytes;
         private bool _decodingComplete;
         private bool _disposed;
@@ -94,19 +103,15 @@ namespace PhotoMusicViewer.Services
                             break;
                         }
 
-                        EnsureCapacity(_decodedBytes + packet.Length * 2L);
-                        foreach (var sample in packet)
-                        {
-                            _pcmData[_decodedBytes++] = (byte)(sample & 0xFF);
-                            _pcmData[_decodedBytes++] = (byte)((sample >> 8) & 0xFF);
-                        }
+                        AppendSamples(packet);
                         Monitor.PulseAll(_lock);
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // повреждённый хвост файла - считаем поток законченным
+                AppLog.Warn("OpusFileReader.DecodeAll", ex);
             }
             finally
             {
@@ -121,17 +126,38 @@ namespace PhotoMusicViewer.Services
             }
         }
 
-        private void EnsureCapacity(long required)
+        /// <summary>
+        /// Дописывает декодированные сэмплы в блочный буфер (PCM16, little-endian).
+        /// Новые блоки выделяются по мере надобности, уже записанное не копируется.
+        /// Вызывается только под _lock.
+        /// </summary>
+        private void AppendSamples(short[] packet)
         {
-            if (required <= _pcmData.Length) return;
+            int written = 0;
 
-            long newSize = _pcmData.Length;
-            while (newSize < required) newSize *= 2;
-            // int.MaxValue превышает максимально допустимый размер массива в .NET,
-            // поэтому ограничиваемся потолком буфера (required не бывает больше него)
-            if (newSize > MaxPcmBytes) newSize = MaxPcmBytes;
+            while (written < packet.Length)
+            {
+                int chunkIndex = (int)(_decodedBytes / ChunkBytes);
+                int offset = (int)(_decodedBytes % ChunkBytes);
 
-            Array.Resize(ref _pcmData, (int)newSize);
+                while (chunkIndex >= _chunks.Count) _chunks.Add(new byte[ChunkBytes]);
+                var chunk = _chunks[chunkIndex];
+
+                // _decodedBytes всегда чётное (2 байта на сэмпл), а ChunkBytes — чётный,
+                // поэтому в блоке всегда есть место как минимум под один целый сэмпл
+                int room = (ChunkBytes - offset) / 2;
+                int take = Math.Min(room, packet.Length - written);
+
+                for (int i = 0; i < take; i++)
+                {
+                    short sample = packet[written + i];
+                    chunk[offset + i * 2] = (byte)(sample & 0xFF);
+                    chunk[offset + i * 2 + 1] = (byte)((sample >> 8) & 0xFF);
+                }
+
+                written += take;
+                _decodedBytes += take * 2L;
+            }
         }
 
         public override WaveFormat WaveFormat => _waveFormat;
@@ -170,9 +196,21 @@ namespace PhotoMusicViewer.Services
                 int bytesToCopy = Math.Min(count, bytesAvailable);
                 if (bytesToCopy <= 0) return 0;
 
-                Array.Copy(_pcmData, _position, buffer, offset, bytesToCopy);
-                _position += bytesToCopy;
-                return bytesToCopy;
+                // Копируем по блокам: запрошенный кусок может пересекать границу блока
+                int copied = 0;
+                while (copied < bytesToCopy)
+                {
+                    long pos = _position + copied;
+                    int chunkIndex = (int)(pos / ChunkBytes);
+                    int chunkOffset = (int)(pos % ChunkBytes);
+                    int take = Math.Min(bytesToCopy - copied, ChunkBytes - chunkOffset);
+
+                    Array.Copy(_chunks[chunkIndex], chunkOffset, buffer, offset + copied, take);
+                    copied += take;
+                }
+
+                _position += copied;
+                return copied;
             }
         }
 
@@ -181,6 +219,10 @@ namespace PhotoMusicViewer.Services
             lock (_lock)
             {
                 _disposed = true;
+                // Освобождаем буфер сразу: длинная запись держит сотни мегабайт,
+                // а после Dispose чтение всё равно возвращает 0
+                _chunks.Clear();
+                _chunks.TrimExcess();
                 Monitor.PulseAll(_lock);
             }
             base.Dispose(disposing);

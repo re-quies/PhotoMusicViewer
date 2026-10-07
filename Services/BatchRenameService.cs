@@ -118,6 +118,7 @@ namespace PhotoMusicViewer.Services
                 }
                 catch (Exception ex)
                 {
+                    AppLog.Warn("BatchRenameService.Rename", ex, AppLog.Describe(item.OldPath));
                     result.ErrorMessage =
                         $"Stopped at \"{Path.GetFileName(item.OldPath)}\": {ex.Message} " +
                         "Files already renamed keep their new names; nothing was overwritten or lost.";
@@ -134,9 +135,10 @@ namespace PhotoMusicViewer.Services
             {
                 results.AddRange(Directory.EnumerateFiles(folder));
             }
-            catch
+            catch (Exception ex)
             {
                 // нет доступа к папке — просто пропускаем её
+                AppLog.Debug("BatchRenameService.CollectFiles", ex);
             }
 
             if (!recursive) return;
@@ -146,8 +148,9 @@ namespace PhotoMusicViewer.Services
             {
                 subdirs = Directory.EnumerateDirectories(folder).ToList();
             }
-            catch
+            catch (Exception ex)
             {
+                AppLog.Debug("BatchRenameService.CollectSubfolders", ex);
                 return;
             }
 

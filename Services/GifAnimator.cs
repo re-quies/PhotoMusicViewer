@@ -1,5 +1,8 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -19,11 +22,42 @@ namespace PhotoMusicViewer.Services
     /// Поэтому здесь каждый кадр заранее собирается на полноразмерном холсте (logical screen)
     /// в формате Pbgra32 с учётом смещения кадра (imgdesc), альфа-смешивания и способа
     /// очистки предыдущего кадра (disposal method).
+    ///
+    /// Быстродействие: сборка идёт в фоновом потоке (см. LoadAsync), поэтому интерфейс
+    /// не замирает на больших GIF. Память ограничена потолком FrameMemoryBudgetBytes:
+    /// если все кадры в полном размере в него не влезают, готовые кадры уменьшаются.
     /// </summary>
     public class GifAnimator
     {
+        /// <summary>
+        /// Анимацию из файла собрать нельзя. Вместо «сырого» FileFormatException наружу
+        /// уходит это исключение с полем ActualFormat, чтобы вызывающий код понимал, что делать:
+        ///  * ActualFormat != Gif — файл назван .gif, но внутри другой формат (WebP, PNG, JPEG,
+        ///    MP4...). GifBitmapDecoder принимает только настоящий GIF и на остальных падает
+        ///    с «Кодек не может использовать указанный тип потока»;
+        ///  * ActualFormat == Gif — это GIF, но повреждённый или оборванный при закачке.
+        /// Отмена при быстром листании (OperationCanceledException) сюда не заворачивается.
+        /// </summary>
+        public sealed class GifUnsupportedException : Exception
+        {
+            /// <summary>Формат, который на самом деле лежит в файле (определён по содержимому).</summary>
+            public SniffedFormat ActualFormat { get; }
+
+            public GifUnsupportedException(SniffedFormat actualFormat, string message, Exception? inner = null)
+                : base(message, inner)
+            {
+                ActualFormat = actualFormat;
+            }
+        }
+
         private const int BytesPerPixel = 4;
         private const int DefaultDelayMs = 100;
+
+        // Потолок памяти на все собранные кадры одного GIF.
+        // Раньше кадры всегда собирались в полном размере: 200 кадров 800x600
+        // занимали ~384 МБ несжатых пикселей. Теперь при превышении потолка
+        // кадры пропорционально уменьшаются.
+        private const long FrameMemoryBudgetBytes = 192L * 1024 * 1024;
 
         private readonly BitmapSource[] _frames;
         private readonly int[] _delaysMs;
@@ -35,15 +69,11 @@ namespace PhotoMusicViewer.Services
 
         public int FrameCount => _frames.Length;
 
-        public GifAnimator(byte[] fileBytes, Image target)
+        private GifAnimator(ComposedGif composed, Image target)
         {
             _target = target;
-
-            using var ms = new MemoryStream(fileBytes);
-            var decoder = new GifBitmapDecoder(ms,
-                BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-
-            ComposeFrames(decoder, out _frames, out _delaysMs);
+            _frames = composed.Frames;
+            _delaysMs = composed.DelaysMs;
 
             // сглаживание при масштабировании: с premultiplied-альфой тёмной каймы не будет
             RenderOptions.SetBitmapScalingMode(_target, BitmapScalingMode.HighQuality);
@@ -51,8 +81,74 @@ namespace PhotoMusicViewer.Services
             _timer.Tick += Timer_Tick;
         }
 
-        /// <summary>Собирает все кадры GIF в готовые к показу полноразмерные изображения.</summary>
-        private static void ComposeFrames(GifBitmapDecoder decoder,
+        /// <summary>
+        /// Читает файл и собирает кадры в фоновом потоке, затем возвращает готовый
+        /// проигрыватель уже в UI-потоке (DispatcherTimer и Image требуют именно его).
+        /// Отмена через token нужна при быстром листании: недоделанная сборка
+        /// прекращается и не тратит процессор впустую.
+        /// </summary>
+        public static async Task<GifAnimator> LoadAsync(string path, Image target, CancellationToken token)
+        {
+            var composed = await Task.Run(() => Compose(path, token), token).ConfigureAwait(true);
+            token.ThrowIfCancellationRequested();
+            return new GifAnimator(composed, target);
+        }
+
+        private sealed class ComposedGif
+        {
+            public BitmapSource[] Frames = Array.Empty<BitmapSource>();
+            public int[] DelaysMs = Array.Empty<int>();
+        }
+
+        private static ComposedGif Compose(string path, CancellationToken token)
+        {
+            // Читаем потоком: BitmapCacheOption.OnLoad всё равно закэширует кадры в памяти,
+            // а лишней копии всех байтов файла (File.ReadAllBytes) при этом не возникает
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                1 << 16, FileOptions.SequentialScan);
+
+            // Расширение .gif не гарантирует GIF внутри: сначала смотрим содержимое.
+            // Detect возвращает позицию потока назад, поэтому декодер читает файл с нуля
+            var actual = ImageFormatSniffer.Detect(stream);
+            if (actual != SniffedFormat.Gif)
+            {
+                throw new GifUnsupportedException(actual,
+                    $"The file has a .gif extension but its content is {actual}.");
+            }
+
+            try
+            {
+                var decoder = new GifBitmapDecoder(stream,
+                    BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+
+                ComposeFrames(decoder, token, out var frames, out var delaysMs);
+                return new ComposedGif { Frames = frames, DelaysMs = delaysMs };
+            }
+            catch (Exception ex) when (IsBrokenFile(ex))
+            {
+                // Настоящий GIF, но оборванный/повреждённый: пусть вызывающий код покажет
+                // хотя бы первый читаемый кадр как обычную картинку
+                throw new GifUnsupportedException(SniffedFormat.Gif,
+                    "The GIF file is damaged or truncated.", ex);
+            }
+        }
+
+        /// <summary>
+        /// Сбой разбора самого файла (а не ошибка в нашем коде и не отмена): так WPF/WIC
+        /// сообщают о битых или оборванных кадрах. OperationCanceledException сюда
+        /// намеренно не входит — это штатный сценарий при быстром листании.
+        /// IOException (файл занят, диск недоступен) тоже не входит: это не «битый файл».
+        /// </summary>
+        private static bool IsBrokenFile(Exception ex) =>
+            ex is FileFormatException ||
+            ex is NotSupportedException ||
+            ex is COMException ||
+            ex is ArgumentException ||
+            ex is IndexOutOfRangeException ||
+            ex is OverflowException;
+
+        /// <summary>Собирает все кадры GIF в готовые к показу изображения.</summary>
+        private static void ComposeFrames(GifBitmapDecoder decoder, CancellationToken token,
             out BitmapSource[] frames, out int[] delaysMs)
         {
             int count = decoder.Frames.Count;
@@ -84,12 +180,18 @@ namespace PhotoMusicViewer.Services
                 return;
             }
 
+            // Во сколько раз уменьшить готовые кадры, чтобы уложиться в потолок памяти
+            double frameScale = GetFrameScale(width, height, count);
+
             int stride = width * BytesPerPixel;
             var canvas = new byte[stride * height];   // Pbgra32, полностью прозрачный
             byte[]? restorePoint = null;
 
             for (int i = 0; i < count; i++)
             {
+                // Быстрое листание: если картинку уже сменили, дальше собирать нечего
+                token.ThrowIfCancellationRequested();
+
                 var frame = decoder.Frames[i];
                 var meta = frame.Metadata as BitmapMetadata;
 
@@ -107,7 +209,7 @@ namespace PhotoMusicViewer.Services
                 var composed = BitmapSource.Create(width, height, 96, 96,
                     PixelFormats.Pbgra32, null, (byte[])canvas.Clone(), stride);
                 composed.Freeze();
-                frames[i] = composed;
+                frames[i] = frameScale < 1.0 ? Downscale(composed, frameScale) : composed;
 
                 // подготовка холста к следующему кадру
                 if (disposal == 2)
@@ -121,6 +223,41 @@ namespace PhotoMusicViewer.Services
                     Array.Copy(restorePoint, canvas, canvas.Length);
                 }
             }
+        }
+
+        /// <summary>
+        /// Коэффициент уменьшения кадров: 1.0, если все кадры в полном размере
+        /// укладываются в потолок памяти. Ниже 0.25 не опускаемся — анимация
+        /// должна оставаться узнаваемой.
+        /// </summary>
+        private static double GetFrameScale(int width, int height, int count)
+        {
+            long needed = (long)width * height * BytesPerPixel * count;
+            if (needed <= FrameMemoryBudgetBytes) return 1.0;
+
+            double scale = Math.Sqrt(FrameMemoryBudgetBytes / (double)needed);
+            return Math.Max(0.25, scale);
+        }
+
+        /// <summary>
+        /// Уменьшает собранный кадр в отдельный буфер. Копируем пиксели, а не оставляем
+        /// TransformedBitmap: иначе полноразмерный кадр остался бы в памяти как источник.
+        /// </summary>
+        private static BitmapSource Downscale(BitmapSource source, double scale)
+        {
+            var transformed = new TransformedBitmap(source, new ScaleTransform(scale, scale));
+
+            int w = transformed.PixelWidth;
+            int h = transformed.PixelHeight;
+            if (w <= 0 || h <= 0) return source;
+
+            int stride = w * BytesPerPixel;
+            var pixels = new byte[stride * h];
+            transformed.CopyPixels(pixels, stride, 0);
+
+            var flat = BitmapSource.Create(w, h, 96, 96, PixelFormats.Pbgra32, null, pixels, stride);
+            flat.Freeze();
+            return flat;
         }
 
         /// <summary>Накладывает кадр на холст с учётом прозрачности (source-over).</summary>
@@ -236,9 +373,10 @@ namespace PhotoMusicViewer.Services
                     _ => null
                 };
             }
-            catch
+            catch (Exception ex)
             {
                 // часть GIF не содержит нужных блоков метаданных
+                AppLog.Debug("GifAnimator.ReadMetadata", ex);
                 return null;
             }
         }

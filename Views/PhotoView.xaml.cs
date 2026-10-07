@@ -45,12 +45,49 @@ private class ThumbnailItem : INotifyPropertyChanged
         set { _thumbnail = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail))); }
     }
 
+    // Размер ячейки задаёт код (сетка всегда в ThumbnailColumns столбцов):
+    // при виртуализации привязаться к панели по имени уже нельзя
+    private double _cellSize = 100;
+    public double CellSize
+    {
+        get => _cellSize;
+        set
+        {
+            if (Math.Abs(_cellSize - value) < 0.5) return;
+            _cellSize = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CellSize)));
+        }
+    }
+
+    /// <summary>Миниатюра уже запрошена: при прокрутке не делаем ту же работу дважды.</summary>
+    public bool LoadRequested { get; set; }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 }
+
+/// <summary>
+/// Одна строка сетки миниатюр. Виртуализация идёт по строкам, поэтому
+/// в папке на тысячи фото создаются только видимые ячейки.
+/// </summary>
+private sealed class ThumbnailRow
+{
+    public List<ThumbnailItem> Items { get; } = new();
+}
         private readonly ObservableCollection<ThumbnailItem> _thumbnailItems = new();
+        private readonly ObservableCollection<ThumbnailRow> _thumbnailRows = new();
         private CancellationTokenSource? _thumbnailLoadCts;
         private string? _gridCurrentFolder;
-        private WrapPanel? _thumbnailWrapPanel;
+        private ScrollViewer? _thumbnailScrollViewer;
+        private double _thumbnailFirstVisibleRow;
+        private double _thumbnailVisibleRows;
+
+        private const int ThumbnailColumns = 11;
+        private const int ThumbnailPreloadRows = 2;   // запас строк выше/ниже видимой области
+        private const int ThumbnailPixelWidth = 220;
+
+        // Общий ограничитель одновременных декодов миниатюр
+        private static readonly SemaphoreSlim ThumbnailDecodeGate =
+            new(Math.Max(2, Environment.ProcessorCount));
 
         private void GridViewButton_Click(object sender, RoutedEventArgs e)
 {
@@ -82,7 +119,7 @@ private void LoadGridFolder(string folderPath)
     if (!isRoot)
     {
         try { parent = Directory.GetParent(folderPath)?.FullName; }
-        catch { parent = null; }
+        catch (Exception ex) { AppLog.Debug("PhotoView.GetParentFolder", ex); parent = null; }
     }
 
     _thumbnailItems.Add(new ThumbnailItem
@@ -99,7 +136,7 @@ private void LoadGridFolder(string folderPath)
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
-    catch { subfolders = new List<string>(); }
+    catch (Exception ex) { AppLog.Warn("PhotoView.EnumerateDirectories", ex); subfolders = new List<string>(); }
 
     List<string> imageFiles;
     try
@@ -108,7 +145,7 @@ private void LoadGridFolder(string folderPath)
             .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
             .ToList();
     }
-    catch { imageFiles = new List<string>(); }
+    catch (Exception ex) { AppLog.Warn("PhotoView.EnumerateFiles", ex); imageFiles = new List<string>(); }
 
     imageFiles = ApplySort(imageFiles);
 
@@ -118,10 +155,25 @@ private void LoadGridFolder(string folderPath)
     foreach (var file in imageFiles)
         _thumbnailItems.Add(new ThumbnailItem { Kind = ItemKind.Image, Path = file });
 
-    ThumbnailItemsControl.ItemsSource = _thumbnailItems;
+    BuildThumbnailRows();
+    ThumbnailItemsControl.ItemsSource = _thumbnailRows;
 
     _thumbnailLoadCts = new CancellationTokenSource();
-    LoadThumbnailsAsync(_thumbnailLoadCts.Token);
+
+    // Сетка открывается на текущем фото, а не в начале папки
+    ScrollThumbnailsToCurrent();
+
+    // Грузим только то, что видно: остальное подтянется при прокрутке
+    QueueVisibleThumbnails();
+
+    // Первый раз шаблон ещё не построен и высота окна неизвестна -
+    // повторяем позиционирование после компоновки
+    Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded,
+        new Action(() =>
+        {
+            ScrollThumbnailsToCurrent();
+            QueueVisibleThumbnails();
+        }));
 }
 private void CloseThumbnailGrid()
 {
@@ -170,7 +222,7 @@ private static void CacheThumbnail(string path, BitmapSource thumb)
 private static long SafeWriteTimeTicks(string path)
 {
     try { return File.GetLastWriteTimeUtc(path).Ticks; }
-    catch { return 0; }
+    catch (Exception ex) { AppLog.Debug("PhotoView.SafeWriteTimeTicks", ex); return 0; }
 }
 
 // --- Упреждающее декодирование соседних фото ---
@@ -178,34 +230,100 @@ private static long SafeWriteTimeTicks(string path)
 // Запись инвалидируется по времени изменения файла: после Rotate/Crop/Strip EXIF
 // или замены файла извне устаревшая копия не используется.
 private static readonly object PrefetchLock = new();
-private static readonly Dictionary<string, (long WriteTimeTicks, BitmapSource Image, long SizeBytes)> PrefetchCache =
+private static readonly Dictionary<string, (long WriteTimeTicks, DecodedImage Decoded)> PrefetchCache =
     new(StringComparer.OrdinalIgnoreCase);
 private const int PrefetchCacheLimit = 4; // текущие соседи + небольшой запас
 
-private static (BitmapSource Image, long SizeBytes) DecodeFullImage(string path)
+/// <summary>Готовое к показу изображение плюс размеры и вес оригинала.</summary>
+private sealed class DecodedImage
 {
-    byte[] fileBytes = File.ReadAllBytes(path);
-    using var ms = new MemoryStream(fileBytes);
-    var decoder = BitmapDecoder.Create(ms, BitmapCreateOptions.PreservePixelFormat,
-        BitmapCacheOption.OnLoad);
-    BitmapSource display = ExifOrientationService.ApplyOrientation(
-        decoder.Frames[0], ExifOrientationService.GetOrientation(decoder.Frames[0]));
-    if (display.CanFreeze) display.Freeze();
-    return (display, fileBytes.LongLength);
+    public BitmapSource Image = null!;
+    public long SizeBytes;
+    // Размеры оригинала (с учётом EXIF-ориентации). Могут быть больше,
+    // чем у Image: для показа фото декодируется с ограничением по стороне.
+    public int NaturalWidth;
+    public int NaturalHeight;
 }
 
-private static bool TryGetPrefetched(string path, out BitmapSource image, out long sizeBytes)
+// Ограничение большей стороны при декодировании для показа. Раньше
+// 24-мегапиксельный снимок разворачивался в памяти целиком (~96 МБ),
+// хотя на экран попадает в разы меньше пикселей.
+// Уточняется в конструкторе по размеру экрана.
+private static int _decodeSideCap = 3072;
+
+/// <summary>
+/// Декодирует фото для показа. maxSide ограничивает большую сторону
+/// (0 - без ограничения, полный размер). EXIF-ориентация применяется на лету,
+/// сам файл не меняется.
+/// </summary>
+private static DecodedImage DecodeFullImage(string path, int maxSide)
 {
-    image = null!;
-    sizeBytes = 0;
+    byte[] fileBytes = File.ReadAllBytes(path);
+
+    int rawWidth = 0, rawHeight = 0, orientation = 1;
+    try
+    {
+        // Заголовки без распаковки пикселей: нужны размер и ориентация
+        using var metaStream = new MemoryStream(fileBytes);
+        var metaDecoder = BitmapDecoder.Create(metaStream,
+            BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
+        var metaFrame = metaDecoder.Frames[0];
+        rawWidth = metaFrame.PixelWidth;
+        rawHeight = metaFrame.PixelHeight;
+        orientation = ExifOrientationService.GetOrientation(metaFrame);
+    }
+    catch (Exception ex)
+    {
+        // не удалось прочитать заголовки - декодируем как есть, без ограничения
+        AppLog.Debug("PhotoView.ReadImageHeaders", ex);
+    }
+
+    // DecodePixelWidth/Height выполняет уменьшение внутри декодера: лишние
+    // пиксели не выделяются вообще. Задаём только одну сторону - вторая
+    // считается сама, пропорции сохраняются.
+    int decodeWidth = 0, decodeHeight = 0;
+    if (maxSide > 0 && rawWidth > 0 && rawHeight > 0)
+    {
+        if (rawWidth >= rawHeight && rawWidth > maxSide) decodeWidth = maxSide;
+        else if (rawHeight > rawWidth && rawHeight > maxSide) decodeHeight = maxSide;
+    }
+
+    // SafeImageDecoder переживает повреждённый ICC-профиль/метаданные
+    // (ArgumentException в ColorContext.GetColorContextsHelper): файл открывается без них
+    BitmapSource bmp = SafeImageDecoder.DecodeScaled(fileBytes, decodeWidth, decodeHeight);
+
+    BitmapSource display = ExifOrientationService.ApplyOrientation(bmp, orientation);
+    if (display.CanFreeze) display.Freeze();
+
+    // Поворот на 90/270 меняет стороны местами
+    bool swapped = orientation is 5 or 6 or 7 or 8;
+    int naturalWidth = swapped ? rawHeight : rawWidth;
+    int naturalHeight = swapped ? rawWidth : rawHeight;
+    if (naturalWidth <= 0 || naturalHeight <= 0)
+    {
+        naturalWidth = display.PixelWidth;
+        naturalHeight = display.PixelHeight;
+    }
+
+    return new DecodedImage
+    {
+        Image = display,
+        SizeBytes = fileBytes.LongLength,
+        NaturalWidth = naturalWidth,
+        NaturalHeight = naturalHeight
+    };
+}
+
+private static bool TryGetPrefetched(string path, out DecodedImage decoded)
+{
+    decoded = null!;
 
     long ticks = SafeWriteTimeTicks(path);
     lock (PrefetchLock)
     {
         if (PrefetchCache.TryGetValue(path, out var entry) && entry.WriteTimeTicks == ticks)
         {
-            image = entry.Image;
-            sizeBytes = entry.SizeBytes;
+            decoded = entry.Decoded;
             return true;
         }
     }
@@ -240,8 +358,8 @@ private void PrefetchNeighbors()
         {
             try
             {
-                var (image, sizeBytes) = DecodeFullImage(path);
-                if (!image.IsFrozen) return; // незамороженный объект нельзя передавать между потоками
+                var decoded = DecodeFullImage(path, _decodeSideCap);
+                if (!decoded.Image.IsFrozen) return; // незамороженный объект нельзя передавать между потоками
 
                 lock (PrefetchLock)
                 {
@@ -250,12 +368,13 @@ private void PrefetchNeighbors()
                     if (PrefetchCache.Count >= PrefetchCacheLimit)
                         PrefetchCache.Clear();
 
-                    PrefetchCache[path] = (SafeWriteTimeTicks(path), image, sizeBytes);
+                    PrefetchCache[path] = (SafeWriteTimeTicks(path), decoded);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // повреждённый/занятый файл - ошибку пользователь увидит при обычном открытии
+                AppLog.Debug("PhotoView.Prefetch", ex, AppLog.Describe(path));
             }
         });
     }
@@ -275,80 +394,177 @@ private static BitmapSource? DecodeThumbnail(string path, int pixelWidth)
                 BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
             orientation = ExifOrientationService.GetOrientation(metaDecoder.Frames[0]);
         }
-        catch
+        catch (Exception ex)
         {
             // не удалось прочитать ориентацию - покажем миниатюру как есть
+            AppLog.Debug("PhotoView.DecodeThumbnail orientation", ex);
         }
 
-        using var ms = new MemoryStream(bytes);
-        var bmp = new BitmapImage();
-        bmp.BeginInit();
-        bmp.CacheOption = BitmapCacheOption.OnLoad;
-        bmp.DecodePixelWidth = pixelWidth;
-        bmp.StreamSource = ms;
-        bmp.EndInit();
-        bmp.Freeze();
+        // тот же устойчивый декодер: миниатюра не должна пропадать из-за битого профиля
+        BitmapSource bmp = SafeImageDecoder.DecodeScaled(bytes, pixelWidth, 0);
 
         return ExifOrientationService.ApplyOrientation(bmp, orientation);
     }
-    catch
+    catch (Exception ex)
     {
+        AppLog.Debug("PhotoView.DecodeThumbnail", ex);
         return null;
     }
 }
 
-private async void LoadThumbnailsAsync(CancellationToken token)
+/// <summary>Собирает плоский список ячеек в строки по ThumbnailColumns штук.</summary>
+private void BuildThumbnailRows()
 {
-    const int thumbnailPixelWidth = 220;
+    _thumbnailRows.Clear();
 
-    var pending = new List<ThumbnailItem>();
-    foreach (var item in _thumbnailItems.ToList())
+    ThumbnailRow? row = null;
+    for (int i = 0; i < _thumbnailItems.Count; i++)
     {
-        if (item.Kind != ItemKind.Image) continue;
-
-        if (TryGetCachedThumbnail(item.Path, out var cached))
-            item.Thumbnail = cached; // мгновенно, без обращения к диску
-        else
-            pending.Add(item);
+        if (i % ThumbnailColumns == 0)
+        {
+            row = new ThumbnailRow();
+            _thumbnailRows.Add(row);
+        }
+        row!.Items.Add(_thumbnailItems[i]);
     }
 
-    if (pending.Count == 0) return;
+    UpdateThumbnailItemSize();
+}
 
-    // Параллельное декодирование вместо строго по одной миниатюре
-    using var semaphore = new SemaphoreSlim(Math.Max(2, Environment.ProcessorCount));
+/// <summary>
+/// Ставит сетку на строку с текущим фото и по возможности центрирует её,
+/// чтобы после перехода из просмотра было видно, где именно в папке находишься.
+/// </summary>
+private void ScrollThumbnailsToCurrent()
+{
+    if (_thumbnailRows.Count == 0) return;
+    if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
 
-    var tasks = pending.Select(async item =>
+    // В сетке может быть открыта другая папка - тогда скроллить некуда
+    string currentPath = _folderFiles[_currentIndex];
+    int index = -1;
+    for (int i = 0; i < _thumbnailItems.Count; i++)
     {
-        try { await semaphore.WaitAsync(token); }
-        catch { return; } // отмена во время ожидания
+        if (_thumbnailItems[i].Kind == ItemKind.Image &&
+            string.Equals(_thumbnailItems[i].Path, currentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            index = i;
+            break;
+        }
+    }
 
+    if (index < 0) return;
+
+    var viewer = _thumbnailScrollViewer ??= FindScrollViewer(ThumbnailItemsControl);
+    if (viewer == null) return;
+
+    int targetRow = index / ThumbnailColumns;
+
+    // Прокрутка идёт по строкам (CanContentScroll=True): ViewportHeight - число видимых строк
+    double viewportRows = viewer.ViewportHeight > 0 ? viewer.ViewportHeight : _thumbnailVisibleRows;
+    double offset = viewportRows > 1
+        ? targetRow - Math.Floor((viewportRows - 1) / 2)
+        : targetRow;
+
+    double maxOffset = Math.Max(0, _thumbnailRows.Count - Math.Max(1, viewportRows));
+    offset = Math.Max(0, Math.Min(offset, maxOffset));
+
+    viewer.ScrollToVerticalOffset(offset);
+    _thumbnailFirstVisibleRow = offset;
+}
+
+/// <summary>Ищет ScrollViewer в шаблоне сетки: до первой прокрутки события ScrollChanged ещё не было.</summary>
+private static ScrollViewer? FindScrollViewer(DependencyObject? root)
+{
+    if (root == null) return null;
+    if (root is ScrollViewer sv) return sv;
+
+    int count = VisualTreeHelper.GetChildrenCount(root);
+    for (int i = 0; i < count; i++)
+    {
+        var found = FindScrollViewer(VisualTreeHelper.GetChild(root, i));
+        if (found != null) return found;
+    }
+
+    return null;
+}
+
+private void ThumbnailScroll_ScrollChanged(object sender, ScrollChangedEventArgs e)
+{
+    if (e.OriginalSource is ScrollViewer viewer) _thumbnailScrollViewer = viewer;
+
+    // Прокрутка идёт по строкам (CanContentScroll=True): смещение - номер
+    // первой видимой строки, ViewportHeight - сколько строк влезает на экран
+    _thumbnailFirstVisibleRow = e.VerticalOffset;
+    _thumbnailVisibleRows = e.ViewportHeight;
+
+    QueueVisibleThumbnails();
+}
+
+/// <summary>
+/// Ставит в очередь декодирование миниатюр только для видимых строк (плюс небольшой
+/// запас). Раньше при открытии папки декодировались миниатюры всех файлов сразу.
+/// </summary>
+private void QueueVisibleThumbnails()
+{
+    if (_thumbnailRows.Count == 0) return;
+    if (ThumbnailOverlay.Visibility != Visibility.Visible) return;
+
+    var token = _thumbnailLoadCts?.Token ?? CancellationToken.None;
+    if (token.IsCancellationRequested) return;
+
+    int visibleRows = _thumbnailVisibleRows > 0 ? (int)Math.Ceiling(_thumbnailVisibleRows) : 6;
+    int firstRow = (int)Math.Floor(_thumbnailFirstVisibleRow);
+
+    int from = Math.Max(0, firstRow - ThumbnailPreloadRows);
+    int to = Math.Min(_thumbnailRows.Count - 1, firstRow + visibleRows + ThumbnailPreloadRows);
+
+    for (int r = from; r <= to; r++)
+        foreach (var item in _thumbnailRows[r].Items)
+            StartThumbnailLoad(item, token);
+}
+
+private void StartThumbnailLoad(ThumbnailItem item, CancellationToken token)
+{
+    if (item.Kind != ItemKind.Image || item.LoadRequested || item.Thumbnail != null) return;
+
+    if (TryGetCachedThumbnail(item.Path, out var cached))
+    {
+        item.LoadRequested = true;
+        item.Thumbnail = cached; // мгновенно, без обращения к диску
+        return;
+    }
+
+    item.LoadRequested = true;
+    _ = LoadThumbnailAsync(item, token);
+}
+
+private async Task LoadThumbnailAsync(ThumbnailItem item, CancellationToken token)
+{
+    try
+    {
+        // Продолжения возвращаются в UI-поток, поэтому Thumbnail ставим напрямую
+        await ThumbnailDecodeGate.WaitAsync(token);
         try
         {
             if (token.IsCancellationRequested) return;
 
-            var thumb = await Task.Run(() => DecodeThumbnail(item.Path, thumbnailPixelWidth), token);
+            var thumb = await Task.Run(() => DecodeThumbnail(item.Path, ThumbnailPixelWidth), token);
             if (thumb == null || token.IsCancellationRequested) return;
 
             CacheThumbnail(item.Path, thumb);
-            await Dispatcher.InvokeAsync(() =>
-            {
-                if (!token.IsCancellationRequested) item.Thumbnail = thumb;
-            });
-        }
-        catch
-        {
-            // отмена или ошибка декодирования - оставляем ячейку без миниатюры
+            item.Thumbnail = thumb;
         }
         finally
         {
-            semaphore.Release();
+            ThumbnailDecodeGate.Release();
         }
-    }).ToList();
-
-    try { await Task.WhenAll(tasks); }
-    catch
+    }
+    catch (Exception ex)
     {
-        // отмена - штатный сценарий при закрытии сетки или смене папки
+        // отмена или ошибка - повторим, если ячейка снова окажется видимой
+        AppLog.Debug("PhotoView.LoadThumbnail", ex, AppLog.Describe(item.Path));
+        item.LoadRequested = false;
     }
 }
 
@@ -397,20 +613,15 @@ private void ThumbnailOverlay_SizeChanged(object sender, SizeChangedEventArgs e)
 
 private void UpdateThumbnailItemSize()
 {
-    if (_thumbnailWrapPanel == null) return;
+    // 24 - поля сетки и место под полосу прокрутки, 4 - отступы ячейки (Margin="2")
+    double available = ThumbnailOverlay.ActualWidth - 24;
+    if (available <= 0) return;
 
-    const int columns = 11;
-    double itemSize = (ThumbnailOverlay.ActualWidth - 20) / columns;
+    double itemSize = available / ThumbnailColumns - 4;
     if (itemSize <= 0) return;
 
-    _thumbnailWrapPanel.ItemWidth = itemSize;
-    _thumbnailWrapPanel.ItemHeight = itemSize;
-}
-    
-private void ThumbnailWrapPanel_Loaded(object sender, RoutedEventArgs e)
-{
-    _thumbnailWrapPanel = sender as WrapPanel;
-    UpdateThumbnailItemSize();
+    foreach (var item in _thumbnailItems)
+        item.CellSize = itemSize;
 }
        internal static readonly string[] SupportedExtensions =
 {
@@ -425,11 +636,23 @@ private void ThumbnailWrapPanel_Loaded(object sender, RoutedEventArgs e)
         
         private enum SortMode { Name, DateModified, Size, Type }
         private SortMode _sortMode = SortMode.Name;
-        private bool _sortDescending = false;
+        private bool _sortDescending = true;
         private long _currentFileSizeBytes;
         private int _currentWidth;
         private int _currentHeight;
         private GifAnimator? _gifAnimator;
+
+        // Асинхронный показ текущего фото: отмена предыдущей загрузки плюс защита
+        // от запоздавшего результата, если пользователь успел пролистать дальше
+        private CancellationTokenSource? _imageLoadCts;
+        private int _showGeneration;
+
+        // Распознавание текста и копирование в буфер тоже уходят в фон:
+        // и то, и другое раньше декодировало снимок прямо в UI-потоке
+        private CancellationTokenSource? _ocrCts;
+        private bool _clipboardCopyInProgress;
+        private int _displayPixelWidth;   // ширина показанной копии в пикселях
+        private bool _fullResRequested;
 
         private bool _isPanning;
 
@@ -445,6 +668,21 @@ private void ThumbnailWrapPanel_Loaded(object sender, RoutedEventArgs e)
         public PhotoView()
 {
     InitializeComponent();
+
+    // Потолок декодирования по размеру экрана: с запасом на зум и HiDPI,
+    // но без холостых сотен мегабайт на каждый снимок
+    try
+    {
+        double screenSide = Math.Max(SystemParameters.PrimaryScreenWidth,
+            SystemParameters.PrimaryScreenHeight);
+        if (screenSide > 0)
+            _decodeSideCap = (int)Math.Clamp(Math.Round(screenSide * 1.5), 2560, 3840);
+    }
+    catch (Exception ex)
+    {
+        // не удалось узнать размер экрана - остаётся значение по умолчанию
+        AppLog.Debug("PhotoView.DetectScreenSize", ex);
+    }
 
     Loc.LanguageChanged += ApplyLocalization;
     ApplyLocalization();
@@ -483,11 +721,11 @@ private void ThumbnailWrapPanel_Loaded(object sender, RoutedEventArgs e)
         .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
         .ToList();
 
-    // Сбрасываем сортировку на "Дата изменения, по возрастанию" для каждой новой открытой папки
+    // Сбрасываем сортировку на "Дата изменения, по убыванию" (новые первыми) для каждой новой открытой папки
     _sortMode = SortMode.DateModified;
-    _sortDescending = false;
+    _sortDescending = true;
     SortModeCombo.SelectedIndex = 1;
-    SortDirectionButton.Content = "\u2191";
+    SortDirectionButton.Content = "\u2193";
 
     SortFolderFiles();
 
@@ -531,68 +769,238 @@ private List<string> ApplySort(List<string> files)
 private static long SafeFileLength(string path)
 {
     try { return new FileInfo(path).Length; }
-    catch { return 0; }
+    catch (Exception ex) { AppLog.Debug("PhotoView.SafeFileLength", ex); return 0; }
 }
         private void ShowCurrent()
         {
             if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
 
             var path = _folderFiles[_currentIndex];
+
+            // Прошлая загрузка больше не нужна: при быстром листании фоновые
+            // декоды отменяются и не занимают процессор
+            _imageLoadCts?.Cancel();
+            _imageLoadCts = new CancellationTokenSource();
+            var token = _imageLoadCts.Token;
+            int generation = ++_showGeneration;
+
+            // Распознавание предыдущего снимка тоже больше не нужно
+            _ocrCts?.Cancel();
+
             _gifAnimator?.Stop();
             _gifAnimator = null;
             ResetTransform();
 
+            _fullResRequested = false;
+            _displayPixelWidth = 0;
+
             var ext = Path.GetExtension(path).ToLowerInvariant();
             ConvertToJpgButton.Visibility = ext == ".webp" ? Visibility.Visible : Visibility.Collapsed;
 
-            try
+            _currentWidth = 0;
+            _currentHeight = 0;
+            _currentFileSizeBytes = SafeFileLength(path);
+
+            if (ext == ".gif")
             {
-                _currentWidth = 0;
-                _currentHeight = 0;
-
-                if (ext == ".gif")
-                {
-                    byte[] fileBytes = File.ReadAllBytes(path);
-                    _currentFileSizeBytes = fileBytes.LongLength;
-                    _gifAnimator = new GifAnimator(fileBytes, MainImage);
-                    _gifAnimator.Start();
-                    GifPlayPauseButton.Content = "\u2759\u2759";
-
-                    // Первый кадр уже установлен аниматором - берём размеры из него без повторного декода
-                    if (MainImage.Source is BitmapSource gifSource)
-                    {
-                        _currentWidth = gifSource.PixelWidth;
-                        _currentHeight = gifSource.PixelHeight;
-                    }
-                }
-                else
-                {
-                    // Сначала пробуем упреждающе декодированную копию (мгновенное листание),
-                    // иначе декодируем синхронно, как раньше: один декод и для показа, и для размеров.
-                    // EXIF-ориентация применяется на лету, сам файл не меняется.
-                    if (!TryGetPrefetched(path, out var display, out var sizeBytes))
-                    {
-                        (display, sizeBytes) = DecodeFullImage(path);
-                    }
-
-                    MainImage.Source = display;
-                    _currentFileSizeBytes = sizeBytes;
-                    _currentWidth = display.PixelWidth;
-                    _currentHeight = display.PixelHeight;
-                }
-
-                UpdateGifButtonVisibility();
-                RefreshFileLabels(path);
-
-                // Фоном декодируем соседние фото, чтобы следующее листание было мгновенным
-                PrefetchNeighbors();
+                MainImage.Source = null;
+                ShowLoadingLabels(path);
+                _ = LoadGifAsync(path, generation, token);
+                return;
             }
-           catch (Exception ex)
+
+            // Упреждающе декодированная копия ставится сразу - листание остаётся мгновенным
+            if (TryGetPrefetched(path, out var prefetched))
+            {
+                ApplyDecodedImage(prefetched, path);
+                PrefetchNeighbors();
+                return;
+            }
+
+            // Иначе декодируем в фоновом потоке: интерфейс не замирает даже
+            // на 50-мегапиксельном снимке или медленном диске
+            MainImage.Source = null;
+            ShowLoadingLabels(path);
+            _ = LoadImageAsync(path, generation, token);
+        }
+
+        /// <summary>Пока фото декодируется, вместо размеров показываем «Загрузка».</summary>
+        private void ShowLoadingLabels(string path)
+        {
+            FileNameDisplay.Text = Path.GetFileName(path);
+            FileMetaText.Text = Loc.T("Loading\u2026", "Загрузка\u2026", "Cargando\u2026") +
+                $"   [{_currentIndex + 1}/{_folderFiles.Count}]";
+            UpdateGifButtonVisibility();
+        }
+
+        private void ApplyDecodedImage(DecodedImage decoded, string path)
+        {
+            MainImage.Source = decoded.Image;
+            _displayPixelWidth = decoded.Image.PixelWidth;
+            _currentFileSizeBytes = decoded.SizeBytes;
+            _currentWidth = decoded.NaturalWidth;
+            _currentHeight = decoded.NaturalHeight;
+
+            UpdateGifButtonVisibility();
+            RefreshFileLabels(path);
+        }
+
+/// <summary>
+/// Декодирует фото в фоновом потоке. Поколение и токен защищают от гонки:
+/// результат применяется только если пользователь всё ещё смотрит этот файл.
+/// </summary>
+private async Task LoadImageAsync(string path, int generation, CancellationToken token,
+    SniffedFormat disguisedAs = SniffedFormat.Unknown)
 {
-    FileNameDisplay.Text = Loc.T("Failed to open", "Не удалось открыть", "No se pudo abrir") + $": {Path.GetFileName(path)} ({ex.Message})";
+    try
+    {
+        var decoded = await Task.Run(() => DecodeFullImage(path, _decodeSideCap), token);
+        if (token.IsCancellationRequested || generation != _showGeneration) return;
+
+        ApplyDecodedImage(decoded, path);
+
+        // Фоном декодируем соседние фото, чтобы следующее листание было мгновенным
+        PrefetchNeighbors();
+    }
+    catch (OperationCanceledException)
+    {
+        // пользователь пролистал дальше - штатный сценарий
+        AppLog.Debug("PhotoView.ShowCurrent отменено");
+    }
+    catch (Exception ex)
+    {
+        AppLog.Error("PhotoView.ShowCurrent", ex, AppLog.Describe(path));
+        if (generation != _showGeneration) return;
+
+        // disguisedAs заполнено, когда сюда пришёл «гиф», оказавшийся другим форматом:
+        // сообщение договаривает, что внутри на самом деле
+        ShowOpenError(path, ex, disguisedAs);
+    }
+}
+
+/// <summary>Собирает кадры GIF в фоне: интерфейс не блокируется на тяжёлых анимациях.</summary>
+private async Task LoadGifAsync(string path, int generation, CancellationToken token)
+{
+    try
+    {
+        var animator = await GifAnimator.LoadAsync(path, MainImage, token);
+        if (token.IsCancellationRequested || generation != _showGeneration)
+        {
+            animator.Stop();
+            return;
+        }
+
+        _gifAnimator = animator;
+        _gifAnimator.Start();
+        GifPlayPauseButton.Content = "\u2759\u2759";
+
+        // Первый кадр уже установлен аниматором - берём размеры из него
+        if (MainImage.Source is BitmapSource gifSource)
+        {
+            _currentWidth = gifSource.PixelWidth;
+            _currentHeight = gifSource.PixelHeight;
+            _displayPixelWidth = gifSource.PixelWidth;
+        }
+
+        UpdateGifButtonVisibility();
+        RefreshFileLabels(path);
+    }
+    catch (OperationCanceledException)
+    {
+        // отмена при листании - штатный сценарий
+        AppLog.Debug("PhotoView.LoadGif отменено");
+    }
+    catch (GifAnimator.GifUnsupportedException ex)
+    {
+        // Файл назван .gif, но внутри другой формат (WebP/PNG/JPEG/MP4...) либо GIF оборван
+        // или повреждён. Это не ошибка приложения, поэтому Warn, а не Error
+        AppLog.Warn("PhotoView.LoadGif", ex,
+            $"{AppLog.Describe(path)}, actual: {ex.ActualFormat}");
+        if (token.IsCancellationRequested || generation != _showGeneration) return;
+
+        // Видео, архив, SVG и т.п. показать нечем, а DecodeFullImage читает файл целиком
+        // в память: на многогигабайтном видео это хуже самой ошибки. Отсекаем сразу
+        if (!ImageFormatSniffer.CanTryStaticImage(ex.ActualFormat))
+        {
+            ShowOpenError(path, ex, ex.ActualFormat);
+            return;
+        }
+
+        // Остальное открываем обычным путём: там уже есть выбор кодека по содержимому,
+        // EXIF-ориентация и уменьшение внутри декодера. Оборванный GIF покажется первым кадром
+        await LoadImageAsync(path, generation, token, ex.ActualFormat);
+    }
+    catch (Exception ex)
+    {
+        // Отдельное имя операции: сбой аниматора не должен быть неотличим от сбоя обычного показа
+        AppLog.Error("PhotoView.LoadGif", ex, AppLog.Describe(path));
+        if (generation != _showGeneration) return;
+        ShowOpenError(path, ex);
+    }
+}
+
+private void ShowOpenError(string path, Exception ex, SniffedFormat actualFormat = SniffedFormat.Unknown)
+{
+    string failed = Loc.T("Failed to open", "Не удалось открыть", "No se pudo abrir");
+    string name = Path.GetFileName(path);
+
+    // Файл выдаёт себя не за тот формат (например, MP4 под именем .gif): говорим, что внутри.
+    // Gif и Unknown сюда не попадают: «на самом деле GIF» ничего не объясняет
+    if (actualFormat != SniffedFormat.Unknown && actualFormat != SniffedFormat.Gif)
+    {
+        string actual = string.Format(
+            Loc.T("it is actually {0}", "на самом деле это {0}", "en realidad es {0}"),
+            ImageFormatSniffer.Describe(actualFormat));
+
+        // Для видео/архива причина исчерпана сама по себе; если же картинку не смог открыть
+        // декодер (например, нет кодека HEIC), его сообщение тоже полезно
+        FileNameDisplay.Text = ex is GifAnimator.GifUnsupportedException
+            ? $"{failed}: {name} — {actual}"
+            : $"{failed}: {name} — {actual} ({ex.Message})";
+    }
+    else
+    {
+        FileNameDisplay.Text = $"{failed}: {name} ({ex.Message})";
+    }
+
     FileMetaText.Text = "";
 }
-        }
+
+/// <summary>
+/// Если пользователь приблизил сильнее, чем позволяет уменьшенная копия,
+/// один раз подгружаем фото в полном разрешении - резкость не теряется.
+/// </summary>
+private void MaybeUpgradeToFullResolution(double scale)
+{
+    if (_fullResRequested) return;
+    if (_gifAnimator != null) return;
+    if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
+    if (_displayPixelWidth <= 0 || _currentWidth <= _displayPixelWidth) return;
+    if (MainImage.ActualWidth <= 0) return;
+
+    // Запас 5%: не дёргаемся на границе
+    if (MainImage.ActualWidth * scale <= _displayPixelWidth * 1.05) return;
+
+    _fullResRequested = true;
+    _ = LoadFullResolutionAsync(_folderFiles[_currentIndex], _showGeneration);
+}
+
+private async Task LoadFullResolutionAsync(string path, int generation)
+{
+    try
+    {
+        var decoded = await Task.Run(() => DecodeFullImage(path, 0));
+        if (generation != _showGeneration) return;
+
+        MainImage.Source = decoded.Image;
+        _displayPixelWidth = decoded.Image.PixelWidth;
+    }
+    catch (Exception ex)
+    {
+        // остаётся уменьшенная копия - показ не ломается
+        AppLog.Debug("PhotoView.UpgradeToFullRes", ex);
+    }
+}
 
 private void RefreshFileLabels(string path)
 {
@@ -725,7 +1133,7 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
             e.Handled = true;
             break;
         case Key.C when (Keyboard.Modifiers & ModifierKeys.Control) != 0:
-            if (_currentIndex >= 0) CopyCurrentImageToClipboard();
+            if (_currentIndex >= 0) _ = CopyCurrentImageToClipboardAsync();
             e.Handled = true;
             break;
         case Key.R:
@@ -841,6 +1249,9 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
     ImageScaleTransform.ScaleX = newScale;
     ImageScaleTransform.ScaleY = newScale;
     UpdateZoomText();
+
+    // При сильном приближении подгружается полное разрешение
+    MaybeUpgradeToFullResolution(newScale);
     e.Handled = true;
 }
 
@@ -933,9 +1344,10 @@ private void StartImageDrag()
     {
         DragDrop.DoDragDrop(MainImage, data, DragDropEffects.Copy);
     }
-    catch
+    catch (Exception ex)
     {
-        // перетаскивание прервано/не удалось - молча игнорируем, без окон
+        // перетаскивание прервано/не удалось - окно не показываем, но пишем в журнал
+        AppLog.Warn("PhotoView.StartImageDrag", ex);
     }
 }
         // --- GIF play/pause ---
@@ -972,27 +1384,53 @@ private void StartImageDrag()
             if (_currentIndex < 0) return;
             var path = _folderFiles[_currentIndex];
 
+            // Повторное нажатие или переход к другому фото отменяют прошлый запуск
+            _ocrCts?.Cancel();
+            _ocrCts = new CancellationTokenSource();
+            var ocrToken = _ocrCts.Token;
+
             OcrButton.IsEnabled = false;
             OcrButton.Content = Loc.T("Scanning...", "Распознавание...", "Reconociendo...");
 
             try
             {
-                var variants = await OcrService.RecognizeTextAsync(path);
-                var found = variants.Where(v => !string.IsNullOrWhiteSpace(v.Text)).ToList();
+                var found = new List<OcrService.OcrVariant>();
+                string? ocrError = null;
 
-                if (found.Count == 0)
+                try
                 {
-                    MessageBox.Show(Loc.T("No text was found on this image.", "На этом изображении текст не найден.", "No se encontró texto en esta imagen."),
+                    var variants = await OcrService.RecognizeTextAsync(path, ocrToken);
+                    found = variants.Where(v => !string.IsNullOrWhiteSpace(v.Text)).ToList();
+                }
+                catch (OperationCanceledException)
+                {
+                    // Пользователь ушёл на другой снимок - окно не показываем
+                    AppLog.Debug("PhotoView.Ocr отменено");
+                    return;
+                }
+                catch (Exception ocrEx)
+                {
+                    AppLog.Warn("OcrService.RecognizeTextAsync", ocrEx);
+                    // Локальный OCR может быть недоступен (нет языковых пакетов Windows) —
+                    // это не повод закрывать окно: фото можно прочитать через Google.
+                    ocrError = ocrEx.Message;
+                }
+
+                if (ocrError != null)
+                {
+                    MessageBox.Show(Loc.T("Local text recognition is unavailable", "Локальное распознавание недоступно", "El reconocimiento local no está disponible")
+                        + ": " + ocrError + Environment.NewLine + Environment.NewLine
+                        + Loc.T("You can still send the photo to Google or Qwen.", "Фото всё равно можно отправить в Google или Qwen.", "Aún puede enviar la foto a Google o Qwen."),
                         "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
                 }
-                else
-                {
-                    var window = new OcrResultWindow(found) { Owner = Window.GetWindow(this) };
-                    window.ShowDialog();
-                }
+
+                // Окно открываем всегда: даже если текст не найден, фото можно отправить в Google
+                var window = new OcrResultWindow(found, path) { Owner = Window.GetWindow(this) };
+                window.ShowDialog();
             }
             catch (Exception ex)
             {
+                AppLog.Error("PhotoView.OcrButton_Click", ex);
                 MessageBox.Show(Loc.T("Text recognition failed", "Не удалось распознать текст", "Error en el reconocimiento de texto") + $": {ex.Message}",
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
             }
@@ -1017,14 +1455,16 @@ private void StartImageDrag()
                 RotateAndSaveService.RotateAndSave(path, 90);
                 ShowCurrent();
             }
-            catch (NotSupportedException)
+            catch (NotSupportedException ex)
             {
+                AppLog.Info("PhotoView.RotateCurrent", ex);
                 MessageBox.Show(
                     Loc.T("Rotation saving isn't supported for this file format.", "Сохранение поворота не поддерживается для этого формата файла.", "Guardar el giro no es compatible con este formato de archivo."),
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
+                AppLog.Error("PhotoView.RotateCurrent", ex);
                 MessageBox.Show(Loc.T("Rotation failed", "Не удалось повернуть", "Error al girar") + $": {ex.Message}",
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
             }
@@ -1046,6 +1486,7 @@ private void StartImageDrag()
     }
     catch (Exception ex)
     {
+        AppLog.Error("PhotoView.ConvertToJpg", ex);
         MessageBox.Show(Loc.T("Conversion failed", "Не удалось конвертировать", "Error de conversión") + $": {ex.Message}",
             "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
     }
@@ -1064,10 +1505,11 @@ private void DeleteCurrentFile()
             Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
             Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
     }
-    catch
+    catch (Exception ex)
     {
         // Удаление не удалось (например, файл занят другим процессом) —
-        // молча ничего не делаем, без всплывающих окон, как и договаривались
+        // окно не показываем, но причина теперь видна в журнале
+        AppLog.Warn("PhotoView.DeleteCurrentFile", ex, AppLog.Describe(path));
         return;
     }
 
@@ -1171,32 +1613,80 @@ private void PhotoView_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     }
     else if (e.ChangedButton == MouseButton.Right)
     {
-        CopyCurrentImageToClipboard();
+        _ = CopyCurrentImageToClipboardAsync();
         e.Handled = true;
     }
 }
-private void CopyCurrentImageToClipboard()
+private async Task CopyCurrentImageToClipboardAsync()
 {
-    if (MainImage.Source is BitmapSource bitmapSource)
+    // Второе нажатие Ctrl+C во время работы не запускает параллельное декодирование
+    if (_clipboardCopyInProgress) return;
+    if (MainImage.Source is not BitmapSource bitmapSource) return;
+
+    _clipboardCopyInProgress = true;
+    try
     {
-        try
+        // Если на экране уменьшенная копия, в буфер кладётся полный размер.
+        // Полноразмерный снимок - это сотни мегабайт и секунды работы, поэтому
+        // декодирование идёт в фоне: раньше окно на это время замирало.
+        if (_gifAnimator == null && _currentIndex >= 0 && _currentIndex < _folderFiles.Count &&
+            _displayPixelWidth > 0 && _currentWidth > _displayPixelWidth)
         {
-            // Картинка кладётся в буфер как обычно (Ctrl+V работает везде),
-            // но помечается флагами приватности: Windows не сохранит её
-            // в историю буфера (Win+V) и не отправит в облачную синхронизацию
-            // на другие устройства. Форматы - стандартные имена, которые
-            // понимает сама Windows; значение DWORD 0 = "нельзя".
-            var data = new DataObject();
-            data.SetImage(bitmapSource);
-            data.SetData("CanIncludeInClipboardHistory", new MemoryStream(BitConverter.GetBytes(0)));
-            data.SetData("CanUploadToCloudClipboard", new MemoryStream(BitConverter.GetBytes(0)));
-            data.SetData("ExcludeClipboardContentFromMonitorProcessing", new MemoryStream(BitConverter.GetBytes(0)));
-            Clipboard.SetDataObject(data, true);
+            var path = _folderFiles[_currentIndex];
+            try
+            {
+                var fullSize = await Task.Run(() =>
+                {
+                    var image = DecodeFullImage(path, 0).Image;
+                    // Передать BitmapSource в UI-поток можно только замороженным
+                    if (image.CanFreeze) image.Freeze();
+                    return image;
+                });
+
+                // Пока шло декодирование, пользователь мог пролистать дальше
+                if (_currentIndex >= 0 && _currentIndex < _folderFiles.Count &&
+                    string.Equals(_folderFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase))
+                    bitmapSource = fullSize;
+            }
+            catch (Exception ex) { AppLog.Warn("PhotoView.ClipboardFullDecode", ex); /* кладём то, что уже показано */ }
         }
-        catch
+
+        // Картинка кладётся в буфер как обычно (Ctrl+V работает везде),
+        // но помечается флагами приватности: Windows не сохранит её
+        // в историю буфера (Win+V) и не отправит в облачную синхронизацию
+        // на другие устройства. Форматы - стандартные имена, которые
+        // понимает сама Windows; значение DWORD 0 = "нельзя".
+        var data = new DataObject();
+        data.SetImage(bitmapSource);
+        data.SetData("CanIncludeInClipboardHistory", new MemoryStream(BitConverter.GetBytes(0)));
+        data.SetData("CanUploadToCloudClipboard", new MemoryStream(BitConverter.GetBytes(0)));
+        data.SetData("ExcludeClipboardContentFromMonitorProcessing", new MemoryStream(BitConverter.GetBytes(0)));
+
+        // Буфер обмена - общий ресурс: пока его держит другое приложение, запись
+        // не проходит. Windows советует повторить попытку через короткую паузу.
+        for (int attempt = 1; attempt <= 5; attempt++)
         {
-            // буфер обмена занят другим процессом - молча игнорируем, без окон
+            try
+            {
+                Clipboard.SetDataObject(data, true);
+                return;
+            }
+            catch (Exception ex) when (attempt < 5)
+            {
+                AppLog.Debug("PhotoView.Clipboard повтор", ex, $"попытка {attempt}");
+                await Task.Delay(60);
+            }
+            catch (Exception ex)
+            {
+                // окно не показываем, но после пяти попыток запись остаётся в журнале
+                AppLog.Warn("PhotoView.Clipboard", ex);
+                return;
+            }
         }
+    }
+    finally
+    {
+        _clipboardCopyInProgress = false;
     }
 }
 private static bool IsWithin(DependencyObject? element, DependencyObject ancestor)
@@ -1250,8 +1740,9 @@ private void CommitRename()
         _folderFiles[_currentIndex] = newPath;
         ReapplySort();
     }
-    catch
+    catch (Exception ex)
     {
+        AppLog.Warn("PhotoView.CommitRename", ex, AppLog.Describe(oldPath));
         RefreshFileLabels(oldPath);
     }
 }
@@ -1262,6 +1753,13 @@ private void CommitRename()
         // --- Локализация (EN/RU) ---
 
         private void LangButton_Click(object sender, RoutedEventArgs e) => Loc.Toggle();
+
+        /// <summary>Открывает меню настроек перевода (ключи API, модель, промты, языки).</summary>
+        private void TranslateSettingsButton_Click(object sender, RoutedEventArgs e)
+        {
+            var settings = new TranslationSettingsWindow { Owner = Window.GetWindow(this) };
+            settings.ShowDialog();
+        }
 
         private void ApplyLocalization()
         {
@@ -1283,6 +1781,7 @@ private void CommitRename()
             ConvertToJpgButton.Content = Loc.T("Convert to JPG", "В JPG", "A JPG");
             GridViewButton.Content = Loc.T("Grid", "Сетка", "Cuadrícula");
             FullscreenButton.Content = Loc.T("Fullscreen", "Во весь экран", "Pantalla completa");
+            TranslateSettingsButton.Content = Loc.T("Translation…", "Перевод…", "Traducción…");
             CropSaveButton.Content = Loc.T("Save", "Сохранить", "Guardar");
             CropCancelButton.Content = Loc.T("Cancel", "Отмена", "Cancelar");
 
@@ -1402,6 +1901,7 @@ private void ReapplySort()
             }
             catch (Exception ex)
             {
+                AppLog.Error("PhotoView.BatchRename prepare", ex);
                 MessageBox.Show(Loc.T("Failed to prepare renaming", "Не удалось подготовить переименование", "No se pudo preparar el renombrado") + $": {ex.Message}",
                     Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
@@ -1486,6 +1986,7 @@ private void ReapplySort()
             }
             catch (Exception ex)
             {
+                AppLog.Error("PhotoView.StripMetadata", ex);
                 MessageBox.Show(Loc.T("Metadata removal failed", "Не удалось удалить метаданные", "Error al eliminar metadatos") + $": {ex.Message}",
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
             }
@@ -1881,21 +2382,26 @@ private void ReapplySort()
             if (MainImage.Source is not BitmapSource source) return;
             if (_cropImageBounds.Width <= 0 || _cropImageBounds.Height <= 0) return;
 
+            // На экране может показываться уменьшенная копия, а обрезается
+            // оригинальный файл - пересчёт идёт в пикселях оригинала
+            int sourceWidth = _currentWidth > 0 ? _currentWidth : source.PixelWidth;
+            int sourceHeight = _currentHeight > 0 ? _currentHeight : source.PixelHeight;
+
             // Перевод рамки из экранных координат в пиксели исходника
-            double sx = source.PixelWidth / _cropImageBounds.Width;
-            double sy = source.PixelHeight / _cropImageBounds.Height;
+            double sx = sourceWidth / _cropImageBounds.Width;
+            double sy = sourceHeight / _cropImageBounds.Height;
 
             int px = (int)Math.Round((_cropRectDisplay.X - _cropImageBounds.X) * sx);
             int py = (int)Math.Round((_cropRectDisplay.Y - _cropImageBounds.Y) * sy);
             int pw = (int)Math.Round(_cropRectDisplay.Width * sx);
             int ph = (int)Math.Round(_cropRectDisplay.Height * sy);
 
-            px = Math.Clamp(px, 0, source.PixelWidth - 1);
-            py = Math.Clamp(py, 0, source.PixelHeight - 1);
-            pw = Math.Clamp(pw, 1, source.PixelWidth - px);
-            ph = Math.Clamp(ph, 1, source.PixelHeight - py);
+            px = Math.Clamp(px, 0, sourceWidth - 1);
+            py = Math.Clamp(py, 0, sourceHeight - 1);
+            pw = Math.Clamp(pw, 1, sourceWidth - px);
+            ph = Math.Clamp(ph, 1, sourceHeight - py);
 
-            if (pw == source.PixelWidth && ph == source.PixelHeight)
+            if (pw == sourceWidth && ph == sourceHeight)
             {
                 // Рамка охватывает всё изображение — обрезать нечего
                 ExitCropMode();
@@ -1953,6 +2459,7 @@ private void ReapplySort()
             }
             catch (Exception ex)
             {
+                AppLog.Error("PhotoView.CropAndSave", ex);
                 MessageBox.Show(Loc.T("Crop failed", "Не удалось обрезать", "Error al recortar") + $": {ex.Message}",
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
             }

@@ -26,9 +26,10 @@ namespace PhotoMusicViewer.Services
                     }
                 }
             }
-            catch
+            catch (System.Exception ex)
             {
                 // формат не поддерживает такие запросы (например PNG/BMP) — считаем ориентацию нормальной
+                AppLog.Debug("ExifOrientationService.GetOrientation", ex);
             }
             return 1;
         }

@@ -19,33 +19,20 @@ namespace PhotoMusicViewer.Services
                 _ => throw new NotSupportedException($"No encoder available for {ext}")
             };
 
-            BitmapFrame original;
-            byte[] fileBytes = File.ReadAllBytes(path);
-            using (var ms = new MemoryStream(fileBytes))
-            {
-                var decoder = BitmapDecoder.Create(ms, BitmapCreateOptions.PreservePixelFormat,
-                    BitmapCacheOption.OnLoad);
-                original = decoder.Frames[0];
-            }
-
             // Метаданные при пересохранении не переносятся (так задумано ради приватности),
-            // поэтому тег EXIF-ориентации пропадёт — "запекаем" его в пиксели до поворота
-            var source = ExifOrientationService.ApplyOrientation(
-                original, ExifOrientationService.GetOrientation(original));
+            // поэтому тег EXIF-ориентации пропадёт — «запекаем» его в пиксели до поворота.
+            // SafeImageDecoder дополнительно защищает от файлов с битым EXIF.
+            var source = SafeImageDecoder.LoadOriented(path);
 
             var rotated = new TransformedBitmap(source,
                 new System.Windows.Media.RotateTransform(NormalizeDegrees(degrees)));
+            if (rotated.CanFreeze) rotated.Freeze();
 
             encoder.Frames.Add(BitmapFrame.Create(rotated));
 
-            var tempPath = path + ".tmp";
-            using (var outStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
-            {
-                encoder.Save(outStream);
-            }
-
-            File.Delete(path);
-            File.Move(tempPath, path);
+            // Запись во временный файл рядом с оригиналом и замена одной операцией
+            // файловой системы: при любом сбое на месте останется целый файл
+            SafeFileReplace.WriteThenReplace(path, stream => encoder.Save(stream));
         }
 
         private static double NormalizeDegrees(int degrees)

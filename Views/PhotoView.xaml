@@ -59,47 +59,71 @@
         </Grid>
 <Grid x:Name="ThumbnailOverlay" Grid.Row="0" Background="{StaticResource BackgroundBrush}"
       Visibility="Collapsed" SizeChanged="ThumbnailOverlay_SizeChanged">
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <ItemsControl x:Name="ThumbnailItemsControl">
-            <ItemsControl.ItemsPanel>
-                <ItemsPanelTemplate>
-                    <WrapPanel x:Name="ThumbnailWrapPanel" Orientation="Horizontal"
-                         Loaded="ThumbnailWrapPanel_Loaded"/>
-                </ItemsPanelTemplate>
-            </ItemsControl.ItemsPanel>
-            <ItemsControl.ItemTemplate>
-    <DataTemplate>
-        <Border Margin="2" Background="{StaticResource PanelBrush}"
-                Width="{Binding ElementName=ThumbnailWrapPanel, Path=ItemWidth}"
-                Height="{Binding ElementName=ThumbnailWrapPanel, Path=ItemHeight}"
-                Cursor="Hand"
-                MouseLeftButtonDown="ThumbnailItem_MouseLeftButtonDown">
-            <Grid>
-                <Image Source="{Binding Thumbnail}" Stretch="Uniform"
-                       Visibility="{Binding ImageVisibility}"/>
+    <!-- Виртуализация по строкам: в памяти живут только видимые ячейки,
+         поэтому папка с тысячами фото открывается сразу -->
+    <ItemsControl x:Name="ThumbnailItemsControl"
+                  VirtualizingPanel.IsVirtualizing="True"
+                  VirtualizingPanel.VirtualizationMode="Recycling"
+                  ScrollViewer.CanContentScroll="True"
+                  ScrollViewer.ScrollChanged="ThumbnailScroll_ScrollChanged">
+        <ItemsControl.Template>
+            <ControlTemplate TargetType="ItemsControl">
+                <ScrollViewer Focusable="False" CanContentScroll="True"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <ItemsPresenter/>
+                </ScrollViewer>
+            </ControlTemplate>
+        </ItemsControl.Template>
+        <ItemsControl.ItemsPanel>
+            <ItemsPanelTemplate>
+                <VirtualizingStackPanel Orientation="Vertical"/>
+            </ItemsPanelTemplate>
+        </ItemsControl.ItemsPanel>
+        <ItemsControl.ItemTemplate>
+            <!-- Одна строка сетки -->
+            <DataTemplate>
+                <ItemsControl ItemsSource="{Binding Items}" HorizontalAlignment="Left">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Margin="2" Background="{StaticResource PanelBrush}"
+                                    Width="{Binding CellSize}"
+                                    Height="{Binding CellSize}"
+                                    Cursor="Hand"
+                                    MouseLeftButtonDown="ThumbnailItem_MouseLeftButtonDown">
+                                <Grid>
+                                    <Image Source="{Binding Thumbnail}" Stretch="Uniform"
+                                           Visibility="{Binding ImageVisibility}"/>
 
-                <StackPanel Visibility="{Binding FolderVisibility}"
-                            HorizontalAlignment="Center" VerticalAlignment="Center">
-                    <TextBlock Text="&#128193;" FontSize="32" HorizontalAlignment="Center"
-                               Foreground="{StaticResource ForegroundBrush}"/>
-                    <TextBlock Text="{Binding DisplayName}" FontSize="11" Margin="4,4,4,0"
-                               HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"
-                               TextAlignment="Center"
-                               MaxWidth="{Binding ElementName=ThumbnailWrapPanel, Path=ItemWidth}"
-                               Foreground="{StaticResource ForegroundBrush}"/>
-                </StackPanel>
+                                    <StackPanel Visibility="{Binding FolderVisibility}"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <TextBlock Text="&#128193;" FontSize="32" HorizontalAlignment="Center"
+                                                   Foreground="{StaticResource ForegroundBrush}"/>
+                                        <TextBlock Text="{Binding DisplayName}" FontSize="11" Margin="4,4,4,0"
+                                                   HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                                   TextAlignment="Center"
+                                                   MaxWidth="{Binding CellSize}"
+                                                   Foreground="{StaticResource ForegroundBrush}"/>
+                                    </StackPanel>
 
-                <TextBlock Text="&#8592;" FontSize="32"
-                           HorizontalAlignment="Center" VerticalAlignment="Center"
-                           Visibility="{Binding BackVisibility}"
-                           Opacity="{Binding BackOpacity}"
-                           Foreground="{StaticResource ForegroundBrush}"/>
-            </Grid>
-        </Border>
-    </DataTemplate>
-</ItemsControl.ItemTemplate>
-        </ItemsControl>
-    </ScrollViewer>
+                                    <TextBlock Text="&#8592;" FontSize="32"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                               Visibility="{Binding BackVisibility}"
+                                               Opacity="{Binding BackOpacity}"
+                                               Foreground="{StaticResource ForegroundBrush}"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </DataTemplate>
+        </ItemsControl.ItemTemplate>
+    </ItemsControl>
 </Grid>
         <!-- Нижняя панель -->
         <Grid x:Name="BottomBar" Grid.Row="1" Background="{StaticResource PanelBrush}" Height="42">
@@ -107,6 +131,7 @@
         <ColumnDefinition Width="Auto"/>
     <ColumnDefinition Width="Auto"/>
     <ColumnDefinition Width="*"/>
+    <ColumnDefinition Width="Auto"/>
     <ColumnDefinition Width="Auto"/>
     <ColumnDefinition Width="Auto"/>
     <ColumnDefinition Width="Auto"/>
@@ -160,7 +185,7 @@
         <ComboBoxItem Content="Size"/>
         <ComboBoxItem Content="Type"/>
     </ComboBox>
-    <Button x:Name="SortDirectionButton" Grid.Column="5" Content="&#8593;" Width="30" Margin="4,4"
+    <Button x:Name="SortDirectionButton" Grid.Column="5" Content="&#8595;" Width="30" Margin="4,4"
             Click="SortDirectionButton_Click" Focusable="False" IsTabStop="False"/>
 
     <Button x:Name="OpenButton" Grid.Column="6" Content="Open" Margin="4,4"
@@ -185,7 +210,9 @@
             Focusable="False" IsTabStop="False"/>
     <Button x:Name="FullscreenButton" Grid.Column="15" Content="Fullscreen" Margin="4,4"
             Click="FullscreenButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="LangButton" Grid.Column="16" Content="EN" Width="40" Margin="4,4"
+    <Button x:Name="TranslateSettingsButton" Grid.Column="16" Content="Translation…" Margin="4,4"
+            Click="TranslateSettingsButton_Click" Focusable="False" IsTabStop="False"/>
+    <Button x:Name="LangButton" Grid.Column="17" Content="EN" Width="40" Margin="4,4"
             ToolTip="Switch language / Переключить язык / Cambiar idioma"
             Click="LangButton_Click" Focusable="False" IsTabStop="False"/>
 </Grid>

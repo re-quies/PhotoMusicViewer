@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -21,21 +22,40 @@ namespace PhotoMusicViewer.Services
         /// <summary>Один вариант распознавания: название языка и прочитанный им текст.</summary>
         public sealed record OcrVariant(string Language, string Code, string Text);
 
-        public static async Task<List<OcrVariant>> RecognizeTextAsync(string imagePath)
+        /// <param name="cancellationToken">
+        /// Отмена: если пользователь ушёл на другой снимок, ждать результат незачем.
+        /// </param>
+        public static async Task<List<OcrVariant>> RecognizeTextAsync(
+            string imagePath, CancellationToken cancellationToken = default)
         {
-            var engines = CreateEngines();
-            if (engines.Count == 0)
-                throw new InvalidOperationException(
-                    "Windows has no OCR language packs installed. " +
-                    "Add a language in Windows Settings -> Time & Language.");
+            // Создание движков и подготовка картинки - это чтение с диска и сотни
+            // мегабайт пикселей. Тело async-метода до первого await выполняется на
+            // потоке вызывающего, поэтому раньше вся эта работа шла в UI-потоке и
+            // окно замирало на секунды. Уносим её в пул потоков.
+            var (engines, softwareBitmap) = await Task.Run(() =>
+            {
+                var created = CreateEngines();
+                if (created.Count == 0)
+                    throw new InvalidOperationException(
+                        "Windows has no OCR language packs installed. " +
+                        "Add a language in Windows Settings -> Time & Language.");
 
-            var softwareBitmap = LoadAsSoftwareBitmap(imagePath, (int)OcrEngine.MaxImageDimension);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // SoftwareBitmap - объект WinRT, а не DispatcherObject: его можно
+                // создать в фоне и использовать в UI-потоке без Freeze
+                var bitmap = LoadAsSoftwareBitmap(imagePath, (int)OcrEngine.MaxImageDimension);
+                return (created, bitmap);
+            }, cancellationToken);
+
             try
             {
                 var variants = new List<OcrVariant>();
 
                 foreach (var engine in engines)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     var result = await engine.RecognizeAsync(softwareBitmap);
 
                     var sb = new StringBuilder();
@@ -98,7 +118,8 @@ namespace PhotoMusicViewer.Services
             using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
                 var decoder = System.Windows.Media.Imaging.BitmapDecoder.Create(
-                    stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                    stream, BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile,
+                    BitmapCacheOption.OnLoad);
                 source = decoder.Frames[0];
             }
 

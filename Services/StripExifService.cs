@@ -28,31 +28,17 @@ namespace PhotoMusicViewer.Services
                 _ => throw new NotSupportedException($"No encoder available for {ext}")
             };
 
-            BitmapFrame original;
-            byte[] fileBytes = File.ReadAllBytes(path);
-            using (var ms = new MemoryStream(fileBytes))
-            {
-                var decoder = BitmapDecoder.Create(ms, BitmapCreateOptions.PreservePixelFormat,
-                    BitmapCacheOption.OnLoad);
-                original = decoder.Frames[0];
-            }
-
-            // Сначала "запекаем" EXIF-ориентацию в пиксели,
-            // иначе после удаления тега фото визуально ляжет на бок
-            var source = ExifOrientationService.ApplyOrientation(
-                original, ExifOrientationService.GetOrientation(original));
+            // Сначала «запекаем» EXIF-ориентацию в пиксели, иначе после удаления
+            // тега фото визуально ляжет на бок. Битые метаданные тут особенно
+            // вероятны — именно такие файлы чаще всего и чистят.
+            var source = SafeImageDecoder.LoadOriented(path);
 
             // BitmapFrame.Create(BitmapSource) не переносит метаданные — именно это нам и нужно
             encoder.Frames.Add(BitmapFrame.Create(source));
 
-            var tempPath = path + ".tmp";
-            using (var outStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
-            {
-                encoder.Save(outStream);
-            }
-
-            File.Delete(path);
-            File.Move(tempPath, path);
+            // Замена исходника одной операцией файловой системы (без окна,
+            // в котором старый файл уже удалён, а новый ещё не записан)
+            SafeFileReplace.WriteThenReplace(path, stream => encoder.Save(stream));
         }
     }
 }

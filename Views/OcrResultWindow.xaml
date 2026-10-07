@@ -1,26 +1,119 @@
 <Window x:Class="PhotoMusicViewer.Views.OcrResultWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Scanned text" Width="560" Height="440" MinWidth="360" MinHeight="260"
+        Title="Scanned text" Width="1000" Height="660" MinWidth="620" MinHeight="420"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
         Background="{StaticResource BackgroundBrush}">
-    <Grid Margin="16">
+
+    <Window.Resources>
+        <Style x:Key="PaneHeader" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}"/>
+            <Setter Property="Opacity" Value="0.7"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+        </Style>
+        <Style x:Key="PaneBox" TargetType="TextBox">
+            <Setter Property="TextWrapping" Value="Wrap"/>
+            <Setter Property="AcceptsReturn" Value="True"/>
+            <Setter Property="VerticalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="Padding" Value="8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Background" Value="{StaticResource PanelBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}"/>
+            <Setter Property="CaretBrush" Value="{StaticResource ForegroundBrush}"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="14">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <TextBox x:Name="ResultTextBox" Grid.Row="0" IsReadOnly="True"
-                 TextWrapping="Wrap" AcceptsReturn="True"
-                 VerticalScrollBarVisibility="Auto"
-                 Padding="8" BorderThickness="0"
-                 Background="{StaticResource PanelBrush}"
-                 Foreground="{StaticResource ForegroundBrush}"
-                 CaretBrush="{StaticResource ForegroundBrush}"/>
+        <!-- Панель действий перевода -->
+        <WrapPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock x:Name="TargetLangLabel" Text="Into:" VerticalAlignment="Center"
+                       Foreground="{StaticResource ForegroundBrush}" Opacity="0.7" Margin="0,0,6,0"/>
+            <ComboBox x:Name="TargetLangCombo" Width="170" Margin="0,0,12,6"
+                      SelectionChanged="TargetLangCombo_SelectionChanged"/>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-            <StackPanel x:Name="CopyButtonsPanel" Orientation="Horizontal"/>
-            <Button x:Name="CloseButton" Content="Close" Width="90" IsCancel="True"/>
-        </StackPanel>
+            <TextBlock x:Name="PromptLabel" Text="Prompt:" VerticalAlignment="Center"
+                       Foreground="{StaticResource ForegroundBrush}" Opacity="0.7" Margin="0,0,6,0"/>
+            <ComboBox x:Name="PromptCombo" Width="200" Margin="0,0,12,6"
+                      SelectionChanged="PromptCombo_SelectionChanged"/>
+
+            <Button x:Name="DeepLButton" Content="DeepL" Margin="0,0,6,6" MinWidth="96"
+                    Click="DeepLButton_Click"/>
+            <Button x:Name="GoogleTextButton" Content="Google" Margin="0,0,6,6" MinWidth="96"
+                    Click="GoogleTextButton_Click"/>
+            <Button x:Name="QwenTextButton" Content="Qwen" Margin="0,0,12,6" MinWidth="96"
+                    Click="QwenTextButton_Click"/>
+            <Button x:Name="GooglePhotoTextButton" Content="Google: photo &#8594; text" Margin="0,0,6,6" MinWidth="150"
+                    Click="GooglePhotoTextButton_Click"/>
+            <Button x:Name="GooglePhotoTranslateButton" Content="Google: photo &#8594; text + translation" Margin="0,0,12,6" MinWidth="200"
+                    Click="GooglePhotoTranslateButton_Click"/>
+            <Button x:Name="QwenPhotoTextButton" Content="Qwen: photo &#8594; text" Margin="0,0,6,6" MinWidth="150"
+                    Click="QwenPhotoTextButton_Click"/>
+            <Button x:Name="QwenPhotoTranslateButton" Content="Qwen: photo &#8594; text + translation" Margin="0,0,12,6" MinWidth="200"
+                    Click="QwenPhotoTranslateButton_Click"/>
+
+            <Button x:Name="CancelRequestButton" Content="Stop" Margin="0,0,6,6" MinWidth="80"
+                    Visibility="Collapsed" Click="CancelRequest_Click"/>
+            <Button x:Name="SettingsButton" Content="Settings…" Margin="0,0,0,6" MinWidth="110"
+                    Click="SettingsButton_Click"/>
+        </WrapPanel>
+
+        <!-- Две панели: исходный текст и перевод -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="180"/>
+                <ColumnDefinition Width="6"/>
+                <ColumnDefinition Width="*" MinWidth="180"/>
+            </Grid.ColumnDefinitions>
+
+            <DockPanel Grid.Column="0">
+                <TextBlock x:Name="SourceHeader" DockPanel.Dock="Top" Text="Recognized text (editable)"
+                           Style="{StaticResource PaneHeader}"/>
+                <TextBox x:Name="SourceTextBox" Style="{StaticResource PaneBox}"
+                         TextChanged="SourceTextBox_TextChanged"/>
+            </DockPanel>
+
+            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch"
+                          Background="{StaticResource BackgroundBrush}"/>
+
+            <DockPanel Grid.Column="2">
+                <TextBlock x:Name="ResultHeader" DockPanel.Dock="Top" Text="Translation"
+                           Style="{StaticResource PaneHeader}"/>
+                <TextBox x:Name="ResultTextBox" Style="{StaticResource PaneBox}" IsReadOnly="True"/>
+            </DockPanel>
+        </Grid>
+
+        <!-- Статус -->
+        <Grid Grid.Row="2" Margin="0,8,0,0">
+            <ProgressBar x:Name="BusyBar" Height="3" IsIndeterminate="True" Visibility="Collapsed"
+                         VerticalAlignment="Top" Background="Transparent" BorderThickness="0"
+                         Foreground="{StaticResource AccentBrush}"/>
+            <TextBlock x:Name="StatusText" Margin="0,8,0,0" Text="" TextWrapping="Wrap"
+                       Foreground="{StaticResource ForegroundBrush}" Opacity="0.75"/>
+        </Grid>
+
+        <!-- Нижние кнопки -->
+        <Grid Grid.Row="3" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <WrapPanel Grid.Column="0">
+                <StackPanel x:Name="CopyButtonsPanel" Orientation="Horizontal"/>
+                <Button x:Name="CopyResultButton" Content="Copy translation" MinWidth="140" Margin="0,0,8,0"
+                        Click="CopyResult_Click"/>
+                <Button x:Name="UseResultAsSourceButton" Content="Translation &#8594; source" MinWidth="150"
+                        Click="UseResultAsSource_Click"/>
+            </WrapPanel>
+
+            <Button x:Name="CloseButton" Grid.Column="1" Content="Close" Width="90" IsCancel="True"/>
+        </Grid>
     </Grid>
 </Window>

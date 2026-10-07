@@ -650,13 +650,13 @@ namespace PhotoMusicViewer.Views
         private static DateTime SafeLastWrite(string path)
         {
             try { return File.GetLastWriteTime(path); }
-            catch { return DateTime.MinValue; }
+            catch (Exception ex) { AppLog.Debug("MusicView.SafeLastWrite", ex); return DateTime.MinValue; }
         }
 
         private static long SafeFileLength(string path)
         {
             try { return new FileInfo(path).Length; }
-            catch { return 0; }
+            catch (Exception ex) { AppLog.Debug("MusicView.SafeFileLength", ex); return 0; }
         }
 
         // --- Список: двойной клик, удаление, очистка, drag-and-drop ---
@@ -1037,9 +1037,10 @@ namespace PhotoMusicViewer.Views
                     track.Path = newPath;
                     ReapplySort();
                 }
-                catch
+                catch (Exception ex)
                 {
                     // не получилось (файл занят/нет прав) - оставляем старое имя
+                    AppLog.Warn("MusicView.RenameTrack", ex, AppLog.Describe(oldPath));
                 }
                 return;
             }
@@ -1055,8 +1056,9 @@ namespace PhotoMusicViewer.Views
                 File.Move(oldPath, newPath);
                 track.Path = newPath;
             }
-            catch
+            catch (Exception ex)
             {
+                AppLog.Warn("MusicView.RenamePlayingTrack", ex, AppLog.Describe(oldPath));
                 newPath = oldPath; // не получилось (файл занят/нет прав) - продолжаем со старым именем
             }
 
@@ -1077,9 +1079,10 @@ namespace PhotoMusicViewer.Views
                     PlayPauseButton.Content = "\u25B6";
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // не удалось перезапустить воспроизведение - трек останется на паузе
+                AppLog.Warn("MusicView.ResumeAfterRename", ex);
             }
         }
     }

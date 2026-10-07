@@ -26,19 +26,11 @@ namespace PhotoMusicViewer.Services
         /// </summary>
         public static string CropAndSave(string path, Int32Rect cropRect, bool replaceOriginal)
         {
-            BitmapFrame original;
-            byte[] fileBytes = File.ReadAllBytes(path);
-            using (var ms = new MemoryStream(fileBytes))
-            {
-                var decoder = BitmapDecoder.Create(ms, BitmapCreateOptions.PreservePixelFormat,
-                    BitmapCacheOption.OnLoad);
-                original = decoder.Frames[0];
-            }
-
-            // Рамка обрезки задаётся относительно того, что видит пользователь на экране,
-            // поэтому перед обрезкой применяем ту же EXIF-ориентацию, что и при показе
-            var source = ExifOrientationService.ApplyOrientation(
-                original, ExifOrientationService.GetOrientation(original));
+            // Рамка обрезки задана относительно того, что видит пользователь,
+            // поэтому берём пиксели с уже применённой EXIF-ориентацией.
+            // SafeImageDecoder переживает файлы с битым EXIF: раньше такой снимок
+            // валился с «Непредвиденный тип или значение свойства», хотя открывался.
+            var source = SafeImageDecoder.LoadOriented(path);
 
             // Страховка: не выходим за границы изображения
             int x = Math.Clamp(cropRect.X, 0, source.PixelWidth - 1);
@@ -47,6 +39,7 @@ namespace PhotoMusicViewer.Services
             int h = Math.Clamp(cropRect.Height, 1, source.PixelHeight - y);
 
             var cropped = new CroppedBitmap(source, new Int32Rect(x, y, w, h));
+            if (cropped.CanFreeze) cropped.Freeze();
 
             var ext = Path.GetExtension(path).ToLowerInvariant();
             string saveExt = ext;
@@ -82,15 +75,8 @@ namespace PhotoMusicViewer.Services
 
             if (replaceOriginal)
             {
-                // Атомарная замена через временный файл — как в RotateAndSaveService
-                var tempPath = path + ".tmp";
-                using (var outStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
-                {
-                    encoder.Save(outStream);
-                }
-
-                File.Delete(path);
-                File.Move(tempPath, path);
+                // Замена через временный файл — как в RotateAndSaveService
+                SafeFileReplace.WriteThenReplace(path, stream => encoder.Save(stream));
                 return path;
             }
 
