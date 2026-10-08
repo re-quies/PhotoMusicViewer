@@ -1,0 +1,7 @@
+libjpeg-turbo 3.2.0, official Windows GCC x64 build 20260630.
+https://github.com/libjpeg-turbo/libjpeg-turbo/releases/tag/3.2.0
+Extracted from official libjpeg-turbo-3.2.0-gcc64.exe. No installer is run by this app.
+jpegtran.exe SHA256 a90d8c20128fcb6a762f704fd011f22159a053a372c9e71f603d88b7c93b084d
+libjpeg-62.dll SHA256 3493ce5a6b0615b44ad8475ee060bd5c965069809a9dc2453b6503af55b9c65e
+Both files must remain together under tools/jpegtran in output/publish directory.
+Only x64 Windows is bundled. Unsupported architectures fail safely; no silent lossy fallback.

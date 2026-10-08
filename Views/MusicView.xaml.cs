@@ -30,6 +30,10 @@ namespace PhotoMusicViewer.Views
 
         private SortMode _sortMode = SortMode.Name;
         private bool _sortDescending;
+        private bool _applyingPreferences, _preferencesReady;
+        private (FileSortKey Key, bool Descending)? _appliedSortPreference;
+        private double? _appliedVolumePreference;
+        private System.Windows.Threading.DispatcherTimer? _volumeSaveTimer;
 
         private int _dragSourceIndex = -1;      // индекс перетаскиваемого трека
         private bool _reorderActive;            // порог перетаскивания пройден
@@ -40,7 +44,8 @@ namespace PhotoMusicViewer.Views
         public event Action<bool>? ModeSwitchRequested;
 
         private enum RepeatMode { Off, RepeatOne, RepeatAll }
-        private enum SortMode { Name, DateModified, Size, Type }
+        // Тот же порядок, что FileSortKey и пункты выпадающего списка.
+        private enum SortMode { Name = 0, DateModified = 1, Size = 2, Type = 3 }
 
         private class TrackItem : INotifyPropertyChanged
         {
@@ -103,8 +108,14 @@ namespace PhotoMusicViewer.Views
             _player.TrackEnded += OnTrackEnded;
             _player.PositionChanged += OnPositionChanged;
             _player.Volume = VolumeSlider.Value;
+            _player.PlaybackStateChanged += () => Dispatcher.Invoke(UpdatePlaybackUi);
             _player.PlaybackError += msg => Dispatcher.Invoke(() =>
-    MessageBox.Show(msg, Loc.T("PhotoMusicViewer - Playback Error", "PhotoMusicViewer - ошибка воспроизведения", "PhotoMusicViewer - Error de reproducción"), MessageBoxButton.OK, MessageBoxImage.Error));
+            {
+                UpdatePlaybackUi();
+                SeekSlider.Value = 0;
+                TimeText.Text = "00:00 / 00:00";
+                MessageBox.Show(msg, Loc.T("PhotoMusicViewer - Playback Error", "PhotoMusicViewer - ошибка воспроизведения", "PhotoMusicViewer - Error de reproducción"), MessageBoxButton.OK, MessageBoxImage.Error);
+            });
             _player.PlaybackNotice += msg => Dispatcher.Invoke(() =>
     MessageBox.Show(msg, "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information));
 
@@ -125,7 +136,65 @@ namespace PhotoMusicViewer.Views
             };
 
             UpdateTrackCounter();
+
+            // Громкость и сортировка плейлиста — из настроек.
+            ApplyPreferences(onlyIfChanged: false);
+            _preferencesReady = true;
+            AppPreferences.Changed += () => ApplyPreferences(onlyIfChanged: true);
+            // Громкость сохраняется с задержкой (ползунок шлёт десятки изменений в секунду)
+            // и обязательно — при выходе.
+            Dispatcher.ShutdownStarted += (_, _) => FlushVolumePreference();
             UpdateVolumeText(VolumeSlider.Value);
+        }
+
+        /// <summary>
+        /// Применяет громкость и сортировку из настроек. onlyIfChanged — после OK в окне
+        /// настроек: трогаем только то, что там поменяли, а не временный выбор на панели.
+        /// </summary>
+        private void ApplyPreferences(bool onlyIfChanged)
+        {
+            var prefs = AppPreferences.Current;
+            _applyingPreferences = true;
+            try
+            {
+                if (!onlyIfChanged || _appliedVolumePreference != prefs.Volume)
+                {
+                    _appliedVolumePreference = prefs.Volume;
+                    VolumeSlider.Value = prefs.Volume;
+                    _player.Volume = prefs.Volume;
+                    UpdateVolumeText(prefs.Volume);
+                }
+                var wanted = (prefs.MusicSort, prefs.MusicSortDescending);
+                if (!onlyIfChanged || _appliedSortPreference != wanted)
+                {
+                    _appliedSortPreference = wanted;
+                    _sortMode = (SortMode)(int)prefs.MusicSort;
+                    _sortDescending = prefs.MusicSortDescending;
+                    SortModeCombo.SelectedIndex = (int)_sortMode;
+                    SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+                    if (onlyIfChanged && _tracks.Count > 0) ReapplySort();
+                }
+            }
+            finally { _applyingPreferences = false; }
+        }
+
+        private void ScheduleVolumeSave()
+        {
+            if (!_preferencesReady || _applyingPreferences) return;
+            if (_volumeSaveTimer == null)
+            {
+                _volumeSaveTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(800) };
+                _volumeSaveTimer.Tick += (_, _) => FlushVolumePreference();
+            }
+            _volumeSaveTimer.Stop();
+            _volumeSaveTimer.Start();
+        }
+
+        private void FlushVolumePreference()
+        {
+            if (_volumeSaveTimer is not { IsEnabled: true }) return;
+            _volumeSaveTimer.Stop();
+            AppPreferences.RememberVolume(VolumeSlider.Value);
         }
 
         // --- Добавление файлов/папок ---
@@ -140,7 +209,7 @@ namespace PhotoMusicViewer.Views
             {
                 // Диалог выбора папки тоже оставляет след в "Недавних файлах" Windows -
                 // чистим его, как это уже делается в фото-режиме
-                PrivacyCleanupService.RemoveFromRecentItems(dialog.FolderName);
+                RecentTracesService.Erase(dialog.FolderName);
 
                 bool wasEmpty = _tracks.Count == 0;
                 AddPathsToPlaylist(new[] { dialog.FolderName });
@@ -166,7 +235,7 @@ namespace PhotoMusicViewer.Views
                 {
                     var files = Directory.EnumerateFiles(path)
                         .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-                        .OrderBy(f => f, StringComparer.OrdinalIgnoreCase);
+                        .OrderBy(f => f, NaturalStringComparer.FileName); // «2 трек» раньше «10 трек»
 
                     foreach (var file in files)
                     {
@@ -181,6 +250,7 @@ namespace PhotoMusicViewer.Views
                         _tracks.Add(new TrackItem { Path = path });
                 }
             }
+            SortAfterAdding();
         }
 
         // --- Воспроизведение ---
@@ -208,12 +278,25 @@ namespace PhotoMusicViewer.Views
             _currentIndex = index;
             TrackListBox.SelectedIndex = index;
             TrackListBox.ScrollIntoView(_tracks[index]);
-            MarkPlayingTrack(_tracks[index]);
-
-            _player.Load(_tracks[index].Path);
+            MarkPlayingTrack(null);
             NowPlayingText.Text = _tracks[index].FileName;
+            SeekSlider.Value = 0;
+            TimeText.Text = "00:00 / 00:00";
+            if (!_player.Load(_tracks[index].Path))
+            {
+                UpdatePlaybackUi();
+                return;
+            }
             _player.Play();
-            PlayPauseButton.Content = "\u23F8";
+            UpdatePlaybackUi();
+        }
+
+        private void UpdatePlaybackUi()
+        {
+            // Отложенный запрос Play ещё не означает, что звук воспроизводится.
+            PlayPauseButton.Content = _player.IsPlaying ? "\u23F8" : "\u25B6";
+            MarkPlayingTrack(_player.IsPlaying && _currentIndex >= 0 && _currentIndex < _tracks.Count
+                ? _tracks[_currentIndex] : null);
         }
 
         private void MarkPlayingTrack(TrackItem? playing)
@@ -243,7 +326,12 @@ namespace PhotoMusicViewer.Views
                 return;
             }
 
-            if (_player.IsPlaying)
+            if (!_player.CanPlay)
+            {
+                LoadTrack(_currentIndex);
+                return;
+            }
+            if (_player.IsPlaying || _player.IsPlayPending)
             {
                 _player.Pause();
                 PlayPauseButton.Content = "\u25B6";
@@ -251,7 +339,7 @@ namespace PhotoMusicViewer.Views
             else
             {
                 _player.Play();
-                PlayPauseButton.Content = "\u23F8";
+                UpdatePlaybackUi();
             }
         }
 
@@ -275,7 +363,7 @@ namespace PhotoMusicViewer.Views
                 // просто перематываем на начало и играем снова
                 _player.SeekTo(TimeSpan.Zero);
                 _player.Play();
-                PlayPauseButton.Content = "\u23F8";
+                UpdatePlaybackUi();
                 return;
             }
 
@@ -371,6 +459,7 @@ namespace PhotoMusicViewer.Views
         {
             _player.Volume = e.NewValue;
             UpdateVolumeText(e.NewValue);
+            ScheduleVolumeSave();
         }
 
         // Точный клик и перетаскивание - как у полоски перемотки
@@ -502,50 +591,6 @@ namespace PhotoMusicViewer.Views
 
         // --- Локализация (EN/RU) ---
 
-        private const string DeveloperGitHubUrl = "https://github.com/re-quies/PhotoMusicViewer";
-
-        private void GitHubButton_Click(object sender, RoutedEventArgs e) => OpenDeveloperGitHub();
-
-        private static void OpenDeveloperGitHub()
-        {
-            if (string.IsNullOrWhiteSpace(DeveloperGitHubUrl))
-            {
-                MessageBox.Show(
-                    Loc.T("The GitHub link isn't set yet.",
-                          "Ссылка на GitHub пока не указана.",
-                          "El enlace de GitHub aún no está configurado."),
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            // открываем только http/https — чтобы кнопка не запустила посторонний файл
-            if (!Uri.TryCreate(DeveloperGitHubUrl, UriKind.Absolute, out var uri) ||
-                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-            {
-                MessageBox.Show(
-                    Loc.T("The GitHub link is invalid. Use an http(s) address.",
-                          "Неверная ссылка на GitHub. Используйте адрес http(s).",
-                          "El enlace de GitHub no es válido. Use una dirección http(s)."),
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            try
-            {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = uri.AbsoluteUri,
-                    UseShellExecute = true   // открывает браузер по умолчанию
-                });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(
-                    Loc.T("Couldn't open the browser: ", "Не удалось открыть браузер: ", "No se pudo abrir el navegador: ") + ex.Message,
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-        }
-
         private void LangButton_Click(object sender, RoutedEventArgs e) => Loc.Toggle();
 
         private void ApplyLocalization()
@@ -555,7 +600,6 @@ namespace PhotoMusicViewer.Views
             PhotoModeToggleBtn.Content = Loc.T("Photo", "Фото", "Foto");
             MusicModeToggleBtn.Content = Loc.T("Music", "Музыка", "Música");
             AddFolderButton.Content = Loc.T("Add Folder", "Добавить папку", "Añadir carpeta");
-            GitHubButton.ToolTip = Loc.T("Open the developer's GitHub page", "Открыть страницу GitHub разработчика", "Abrir la página de GitHub del desarrollador");
             ShuffleButton.Content = Loc.T("Shuffle", "Перемешать", "Aleatorio");
             RemoveTrackButton.Content = Loc.T("Remove", "Убрать", "Quitar");
             ClearButton.Content = Loc.T("Clear", "Очистить", "Vaciar");
@@ -586,8 +630,8 @@ namespace PhotoMusicViewer.Views
 
         private void SortModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_tracks.Count == 0) return;
-
+            if (_applyingPreferences) return;
+            // Выбор сохраняется и при пустом плейлисте (раньше он молча терялся).
             _sortMode = SortModeCombo.SelectedIndex switch
             {
                 0 => SortMode.Name,
@@ -596,18 +640,28 @@ namespace PhotoMusicViewer.Views
                 3 => SortMode.Type,
                 _ => SortMode.Name
             };
+            if (_preferencesReady) AppPreferences.RememberMusicSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-            ReapplySort();
+            if (_tracks.Count > 0) ReapplySort();
         }
 
         private void SortDirectionButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_tracks.Count == 0) return;
-
             _sortDescending = !_sortDescending;
             SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+            AppPreferences.RememberMusicSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-            ReapplySort();
+            if (_tracks.Count > 0) ReapplySort();
+        }
+
+        /// <summary>
+        /// «Имя ↑» — порядок добавления (папка за папкой, внутри — естественный по имени),
+        /// чтобы альбомы не перемешивались. Любая другая выбранная сортировка применяется
+        /// и к новым трекам, иначе список не совпадал бы с тем, что показано на панели.
+        /// </summary>
+        private void SortAfterAdding()
+        {
+            if (_tracks.Count > 1 && (_sortMode != SortMode.Name || _sortDescending)) ReapplySort();
         }
 
         private void ReapplySort()
@@ -620,11 +674,11 @@ namespace PhotoMusicViewer.Views
 
             query = _sortMode switch
             {
-                SortMode.Name => query.OrderBy(t => t.FileName, StringComparer.OrdinalIgnoreCase),
-                SortMode.DateModified => query.OrderBy(t => SafeLastWrite(t.Path)),
-                SortMode.Size => query.OrderBy(t => SafeFileLength(t.Path)),
-                SortMode.Type => query.OrderBy(t => Path.GetExtension(t.Path).ToLowerInvariant())
-                                      .ThenBy(t => t.FileName, StringComparer.OrdinalIgnoreCase),
+                SortMode.Name => query.OrderBy(t => t.Path, NaturalStringComparer.FileName),
+                SortMode.DateModified => query.OrderBy(t => SafeLastWrite(t.Path)).ThenBy(t => t.Path, NaturalStringComparer.FileName),
+                SortMode.Size => query.OrderBy(t => SafeFileLength(t.Path)).ThenBy(t => t.Path, NaturalStringComparer.FileName),
+                SortMode.Type => query.OrderBy(t => Path.GetExtension(t.Path).ToLowerInvariant(), StringComparer.Ordinal)
+                                      .ThenBy(t => t.Path, NaturalStringComparer.FileName),
                 _ => query
             };
 
@@ -1067,12 +1121,16 @@ namespace PhotoMusicViewer.Views
 
             try
             {
-                _player.Load(newPath);
+                if (!_player.Load(newPath))
+                {
+                    UpdatePlaybackUi();
+                    return;
+                }
                 _player.SeekTo(position);
                 if (wasPlaying)
                 {
                     _player.Play();
-                    PlayPauseButton.Content = "\u23F8";
+                    UpdatePlaybackUi();
                 }
                 else
                 {

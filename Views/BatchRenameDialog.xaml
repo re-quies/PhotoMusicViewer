@@ -23,7 +23,9 @@
         </ComboBox>
 
         <CheckBox x:Name="RecursiveCheck" Content="Include subfolders"
-                  Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,12"/>
+                  Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,2"/>
+        <TextBlock x:Name="RecursiveHint" Foreground="{StaticResource ForegroundBrush}" Opacity="0.65"
+                   TextWrapping="Wrap" Margin="20,0,0,12" FontSize="11"/>
 
         <TextBlock x:Name="InfoText" Text="Only photo and GIF files are renamed. Files whose names are already numbers are skipped. Existing files are never overwritten."
                    Foreground="{StaticResource ForegroundBrush}" Opacity="0.65"

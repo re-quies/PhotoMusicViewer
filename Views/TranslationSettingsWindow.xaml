@@ -1,7 +1,7 @@
 <Window x:Class="PhotoMusicViewer.Views.TranslationSettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Translation settings" Width="720" Height="760"
+        Title="Settings" Width="720" Height="760"
         MinWidth="560" MinHeight="520"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
         Background="{StaticResource BackgroundBrush}">
@@ -60,8 +60,76 @@
         <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
             <StackPanel>
 
+                <!-- ============================ ИНТЕРФЕЙС ============================ -->
+                <!-- Язык при запуске, сортировка, громкость: preferences.json, без путей и имён файлов -->
+                <TextBlock x:Name="InterfaceHeader" Text="Interface" Style="{StaticResource SectionHeader}" Margin="0,0,0,6"/>
+
+                <TextBlock x:Name="StartupLanguageLabel" Text="Language at startup" Style="{StaticResource FieldLabel}"/>
+                <ComboBox x:Name="StartupLanguageCombo" Width="220" HorizontalAlignment="Left">
+                    <ComboBoxItem Tag="System" Content="As in Windows"/>
+                    <ComboBoxItem Tag="English" Content="English"/>
+                    <ComboBoxItem Tag="Russian" Content="Русский"/>
+                    <ComboBoxItem Tag="Spanish" Content="Español"/>
+                </ComboBox>
+                <CheckBox x:Name="RememberLanguageCheck" Margin="0,6,0,0"
+                          Content="Remember the language chosen with the EN / RU / ES button"/>
+
+                <Grid Margin="0,4,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock x:Name="PhotoSortLabel" Text="Photo sorting" Style="{StaticResource FieldLabel}"/>
+                        <StackPanel Orientation="Horizontal">
+                            <ComboBox x:Name="PhotoSortCombo" Width="140">
+                                <ComboBoxItem Content="Name"/>
+                                <ComboBoxItem Content="Date modified"/>
+                                <ComboBoxItem Content="Size"/>
+                                <ComboBoxItem Content="Type"/>
+                            </ComboBox>
+                            <ComboBox x:Name="PhotoSortDirectionCombo" Width="140" Margin="6,0,0,0">
+                                <ComboBoxItem Content="Ascending ↑"/>
+                                <ComboBoxItem Content="Descending ↓"/>
+                            </ComboBox>
+                        </StackPanel>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                        <TextBlock x:Name="MusicSortLabel" Text="Playlist sorting" Style="{StaticResource FieldLabel}"/>
+                        <StackPanel Orientation="Horizontal">
+                            <ComboBox x:Name="MusicSortCombo" Width="140">
+                                <ComboBoxItem Content="Name"/>
+                                <ComboBoxItem Content="Date modified"/>
+                                <ComboBoxItem Content="Size"/>
+                                <ComboBoxItem Content="Type"/>
+                            </ComboBox>
+                            <ComboBox x:Name="MusicSortDirectionCombo" Width="140" Margin="6,0,0,0">
+                                <ComboBoxItem Content="Ascending ↑"/>
+                                <ComboBoxItem Content="Descending ↓"/>
+                            </ComboBox>
+                        </StackPanel>
+                    </StackPanel>
+                </Grid>
+                <CheckBox x:Name="RememberSortCheck" Margin="0,6,0,0"
+                          Content="Remember the sorting chosen on the toolbar"/>
+
+                <TextBlock x:Name="VolumeLabel" Text="Volume at startup" Style="{StaticResource FieldLabel}"/>
+                <StackPanel Orientation="Horizontal">
+                    <Slider x:Name="StartupVolumeSlider" Width="220" Minimum="0" Maximum="100"
+                            SmallChange="1" LargeChange="10" IsSnapToTickEnabled="True" TickFrequency="1"
+                            VerticalAlignment="Center" ValueChanged="StartupVolumeSlider_ValueChanged"/>
+                    <TextBlock x:Name="StartupVolumeText" Text="80%" Margin="8,0,0,0" MinWidth="40" VerticalAlignment="Center"/>
+                </StackPanel>
+                <CheckBox x:Name="RememberVolumeCheck" Margin="0,6,0,0"
+                          Content="Remember the last volume"/>
+                <CheckBox x:Name="ConfirmDeleteCheck" Margin="0,10,0,0"
+                          Content="Ask before moving a photo to the Recycle Bin"/>
+                <TextBlock x:Name="ConfirmDeleteHint" Style="{StaticResource HintText}" Margin="22,0,0,0"/>
+                <TextBlock x:Name="InterfaceHint" Style="{StaticResource HintText}"/>
+
                 <!-- ============================ КЛЮЧИ ============================ -->
-                <TextBlock x:Name="KeysHeader" Text="API keys" Style="{StaticResource SectionHeader}" Margin="0,0,0,6"/>
+                <TextBlock x:Name="KeysHeader" Text="API keys" Style="{StaticResource SectionHeader}"/>
 
                 <TextBlock x:Name="DeepLKeyLabel" Text="DeepL API key" Style="{StaticResource FieldLabel}"/>
                 <Grid>
@@ -110,16 +178,6 @@
                         <ComboBox x:Name="SourceLangCombo"/>
                     </StackPanel>
                 </Grid>
-
-                <TextBlock x:Name="StartupLangLabel" Text="Interface language at startup" Style="{StaticResource FieldLabel}"/>
-                <ComboBox x:Name="StartupLangCombo">
-                    <ComboBoxItem Tag="English" Content="English"/>
-                    <ComboBoxItem Tag="Russian" Content="Русский"/>
-                    <ComboBoxItem Tag="Spanish" Content="Español"/>
-                    <ComboBoxItem x:Name="StartupLangSystemItem" Tag="System" Content="System language"/>
-                </ComboBox>
-                <TextBlock x:Name="StartupLangHint" Style="{StaticResource HintText}"
-                           Text="The app opens in this language. The EN/RU/ES button still switches it on the fly."/>
 
                 <!-- ============================ GOOGLE ============================ -->
                 <TextBlock x:Name="GoogleHeader" Text="Google" Style="{StaticResource SectionHeader}"/>
@@ -210,6 +268,7 @@
 
                 <TextBlock x:Name="QwenBaseUrlLabel" Text="Own Base URL" Style="{StaticResource FieldLabel}"/>
                 <TextBox x:Name="QwenBaseUrlBox"/>
+                <CheckBox x:Name="QwenLoopbackHttpCheck" Content="Allow HTTP only for local loopback" Margin="0,6,0,0"/>
                 <TextBlock x:Name="QwenBaseUrlHint" Style="{StaticResource HintText}"
                            Text="Used with the option above. Example: https://your-workspace-id.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"/>
 
@@ -304,9 +363,9 @@
                 <CheckBox x:Name="StripMetaCheck" Margin="0,12,0,6"
                           Content="Re-encode the photo before sending (removes EXIF/GPS, sends pixels only)"/>
                 <CheckBox x:Name="AskNetworkCheck"
-                          Content="Ask for confirmation before the first network request in a session"/>
+                          Content="Ask for confirmation before sending — separately for text and for photos"/>
                 <CheckBox x:Name="PersistCheck" Checked="PersistCheck_Changed" Unchecked="PersistCheck_Changed"
-                          Content="Save these settings and keys to a file in plain text"/>
+                          Content="Remember settings and keys on this computer (keys are encrypted with Windows DPAPI)"/>
 
                 <TextBlock x:Name="PersistPathText" Style="{StaticResource HintText}" Margin="22,0,0,0"/>
 
@@ -325,8 +384,35 @@
                     <Button x:Name="DeleteLogButton" Content="Delete log" Click="DeleteLog_Click"/>
                 </StackPanel>
 
+                <!-- Уборка следов в Windows: обе галочки по умолчанию выключены -->
+                <TextBlock x:Name="TracesHeader" Text="Traces in Windows" Style="{StaticResource FieldLabel}" Margin="0,16,0,0"/>
+                <CheckBox x:Name="CleanRecentCheck" Margin="0,6,0,0"
+                          Checked="TraceCleanupCheck_Changed" Unchecked="TraceCleanupCheck_Changed"
+                          Content="Remove opened files from Recent items"/>
+                <CheckBox x:Name="CleanRegistryCheck" Margin="0,6,0,0"
+                          Checked="TraceCleanupCheck_Changed" Unchecked="TraceCleanupCheck_Changed"
+                          Content="Remove opened files from Explorer registry history"/>
+                <TextBlock x:Name="TracesHint" Style="{StaticResource HintText}" Margin="22,0,0,0"/>
+
+                <!-- Дисковый кэш миниатюр: по умолчанию выключен (след на диске) -->
+                <CheckBox x:Name="ThumbCacheCheck" Margin="0,16,0,0"
+                          Checked="ThumbCacheCheck_Changed" Unchecked="ThumbCacheCheck_Changed"
+                          Content="Keep thumbnails on disk (the thumbnail grid opens faster)"/>
+                <TextBlock x:Name="ThumbCacheText" Style="{StaticResource HintText}" Margin="22,0,0,0"/>
+                <StackPanel Orientation="Horizontal" Margin="22,8,0,0">
+                    <Button x:Name="ClearThumbCacheButton" Content="Clear thumbnail cache" Click="ClearThumbCache_Click"/>
+                </StackPanel>
+
                 <TextBlock x:Name="PrivacyNotice" Style="{StaticResource HintText}" Margin="0,12,0,0"
                            Text="Everything else in this app stays offline. Text or photos leave your computer only when you press a translate button, and only to the service you pressed."/>
+
+                <!-- ============================ О ПРОГРАММЕ ============================ -->
+                <TextBlock x:Name="AboutHeader" Text="About" Style="{StaticResource SectionHeader}"/>
+                <TextBlock x:Name="VersionText" Text="PhotoMusicViewer" Margin="0,0,0,6"/>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="GitHubButton" Content="Open project page on GitHub" Click="GitHub_Click"/>
+                </StackPanel>
+                <TextBlock x:Name="GitHubHint" Style="{StaticResource HintText}"/>
             </StackPanel>
         </ScrollViewer>
 

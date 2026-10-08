@@ -240,7 +240,7 @@ namespace PhotoMusicViewer.Views
             string text = TextToTranslate();
             if (text.Length == 0) return;
 
-            _ = RunAsync(ct => TranslationService.TranslateWithDeepLAsync(text, TranslationConfig.Current, ct));
+            _ = RunAsync(NetworkDataKind.Text, TranslationProvider.DeepL, (settings, ct) => TranslationService.TranslateWithDeepLAsync(text, settings, ct));
         }
 
         private void GoogleTextButton_Click(object sender, RoutedEventArgs e)
@@ -249,22 +249,22 @@ namespace PhotoMusicViewer.Views
             if (text.Length == 0) return;
 
             var prompt = (PromptCombo.SelectedItem as PromptPreset)?.Text;
-            _ = RunAsync(ct => TranslationService.TranslateWithGoogleAsync(
-                text, TranslationConfig.Current, prompt, ct));
+            _ = RunAsync(NetworkDataKind.Text, TranslationProvider.Google, (settings, ct) => TranslationService.TranslateWithGoogleAsync(
+                text, settings, prompt, ct));
         }
 
         private void GooglePhotoTextButton_Click(object sender, RoutedEventArgs e)
         {
             if (_imagePath == null) return;
-            _ = RunAsync(ct => TranslationService.RecognizeImageWithGoogleAsync(
-                _imagePath, TranslationConfig.Current, false, ct));
+            _ = RunAsync(NetworkDataKind.Image, TranslationProvider.Google, (settings, ct) => TranslationService.RecognizeImageWithGoogleAsync(
+                _imagePath, settings, false, ct));
         }
 
         private void GooglePhotoTranslateButton_Click(object sender, RoutedEventArgs e)
         {
             if (_imagePath == null) return;
-            _ = RunAsync(ct => TranslationService.RecognizeImageWithGoogleAsync(
-                _imagePath, TranslationConfig.Current, true, ct));
+            _ = RunAsync(NetworkDataKind.Image, TranslationProvider.Google, (settings, ct) => TranslationService.RecognizeImageWithGoogleAsync(
+                _imagePath, settings, true, ct));
         }
 
         private void QwenTextButton_Click(object sender, RoutedEventArgs e)
@@ -273,22 +273,22 @@ namespace PhotoMusicViewer.Views
             if (text.Length == 0) return;
 
             var prompt = (PromptCombo.SelectedItem as PromptPreset)?.Text;
-            _ = RunAsync(ct => TranslationService.TranslateWithQwenAsync(
-                text, TranslationConfig.Current, prompt, ct));
+            _ = RunAsync(NetworkDataKind.Text, TranslationProvider.Qwen, (settings, ct) => TranslationService.TranslateWithQwenAsync(
+                text, settings, prompt, ct));
         }
 
         private void QwenPhotoTextButton_Click(object sender, RoutedEventArgs e)
         {
             if (_imagePath == null) return;
-            _ = RunAsync(ct => TranslationService.RecognizeImageWithQwenAsync(
-                _imagePath, TranslationConfig.Current, false, ct));
+            _ = RunAsync(NetworkDataKind.Image, TranslationProvider.Qwen, (settings, ct) => TranslationService.RecognizeImageWithQwenAsync(
+                _imagePath, settings, false, ct));
         }
 
         private void QwenPhotoTranslateButton_Click(object sender, RoutedEventArgs e)
         {
             if (_imagePath == null) return;
-            _ = RunAsync(ct => TranslationService.RecognizeImageWithQwenAsync(
-                _imagePath, TranslationConfig.Current, true, ct));
+            _ = RunAsync(NetworkDataKind.Image, TranslationProvider.Qwen, (settings, ct) => TranslationService.RecognizeImageWithQwenAsync(
+                _imagePath, settings, true, ct));
         }
 
         /// <summary>Если часть текста выделена — переводим только её, иначе всю панель.</summary>
@@ -306,20 +306,27 @@ namespace PhotoMusicViewer.Views
             return text;
         }
 
-        private async Task RunAsync(Func<CancellationToken, Task<TranslationResult>> action)
+        private async Task RunAsync(NetworkDataKind kind, TranslationProvider provider, Func<TranslationSettings, CancellationToken, Task<TranslationResult>> action)
         {
             if (_busy) return;
-            if (!EnsureNetworkConsent()) return;
+            var settings = TranslationConfig.Current.Clone();
+            string endpoint;
+            try
+            {
+                endpoint = TranslationService.GetEndpoint(provider, kind, settings);
+                if (!EnsureNetworkConsent(kind, endpoint)) return;
+            }
+            catch (TranslationException ex) { SetStatus(ex.Message); return; }
 
             SetBusy(true);
-            SetStatus(Loc.T("Sending the request…", "Отправляю запрос…", "Enviando la solicitud…"));
+            SetStatus(Loc.T("Sending the request…", "Отправляю запрос…", "Enviando la solicitud…") + " → " + NetworkEndpointPolicy.Origin(endpoint));
 
             _cts = new CancellationTokenSource();
             var watch = Stopwatch.StartNew();
 
             try
             {
-                var result = await action(_cts.Token);
+                var result = await action(settings, _cts.Token);
                 watch.Stop();
 
                 if (!string.IsNullOrWhiteSpace(result.SourceText))
@@ -368,27 +375,16 @@ namespace PhotoMusicViewer.Views
             }
         }
 
-        /// <summary>Одноразовое подтверждение: до него приложение не делает ни одного сетевого запроса.</summary>
-        private bool EnsureNetworkConsent()
+        /// <summary>
+        /// Подтверждение перед отправкой. Согласия раздельные: «да» на текст не разрешает
+        /// отправку самой фотографии — в кадр попадает куда больше, чем в распознанный текст.
+        /// </summary>
+        private bool EnsureNetworkConsent(NetworkDataKind kind, string endpoint)
         {
-            var settings = TranslationConfig.Current;
-            if (!settings.AskBeforeNetwork || TranslationConfig.NetworkAllowedForSession) return true;
+            if (NetworkConsentDialog.Ensure(this, kind, new[] { endpoint })) return true;
 
-            var answer = MessageBox.Show(this,
-                Loc.T(
-                    "This app works offline. Translation is the only feature that sends data out: the text you translate, or the photo itself in the \"photo\" modes, goes to the service you chose. Continue?",
-                    "Приложение работает оффлайн. Перевод — единственная функция, которая отправляет данные наружу: текст, который вы переводите, а в режимах «фото» — само изображение. Продолжить?",
-                    "La aplicación funciona sin conexión. La traducción es lo único que envía datos: el texto o la propia foto. ¿Continuar?"),
-                Title, MessageBoxButton.YesNo, MessageBoxImage.Question);
-
-            if (answer != MessageBoxResult.Yes)
-            {
-                SetStatus(Loc.T("Nothing was sent.", "Ничего не отправлено.", "No se envió nada."));
-                return false;
-            }
-
-            TranslationConfig.NetworkAllowedForSession = true;
-            return true;
+            SetStatus(NetworkConsentDialog.Declined);
+            return false;
         }
 
         private void CancelRequest_Click(object sender, RoutedEventArgs e)
@@ -401,7 +397,6 @@ namespace PhotoMusicViewer.Views
             var window = new TranslationSettingsWindow { Owner = this };
             if (window.ShowDialog() == true)
             {
-                ApplyLocalization(); // язык мог смениться прямо в настройках
                 RefreshTranslationControls();
                 UpdateButtons();
             }

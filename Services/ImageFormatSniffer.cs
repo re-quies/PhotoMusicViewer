@@ -1,234 +1,226 @@
 using System;
 using System.IO;
-using System.Text;
 
 namespace PhotoMusicViewer.Services
 {
-    /// <summary>Формат файла, определённый по содержимому (а не по расширению).</summary>
-    public enum SniffedFormat
+    /// <summary>Формат файла, определённый по сигнатуре — первым байтам, а не по расширению.</summary>
+    internal enum ImageFileFormat
     {
         Unknown,
-        Gif, Png, Jpeg, WebP, Bmp, Tiff, Heic, Avif, Ico, Psd,
-        Svg, Mp4, WebM, Avi, Zip
+        Gif,
+        Png,
+        Jpeg,
+        WebP,
+        Bmp,
+        Tiff,
+        Heif,
+        Avif,
+        Ico,
+        Psd,
+        Svg,
+        Mp4,
+        WebM,
+        Avi,
+        Archive
     }
 
     /// <summary>
-    /// Определяет настоящий формат файла по первым байтам. Расширению верить нельзя:
-    /// «гифки» из интернета и мессенджеров нередко оказываются WebP, PNG или даже MP4.
+    /// Определяет настоящий формат файла по первым байтам.
     ///
-    /// Чтение из потока возвращает позицию назад, поэтому тот же FileStream сразу
-    /// можно отдавать в декодер — второго открытия файла не нужно.
+    /// Зачем нужен: расширение ничего не гарантирует. Мессенджеры, соцсети и
+    /// «скачиватели гифок» массово раздают под именем *.gif либо WebP, либо PNG,
+    /// либо вовсе MP4 — анимация там есть, а GIF внутри нет.
     ///
-    /// Особые случаи:
-    ///  * ISO BMFF (блок «ftyp») — общий контейнер и для картинок (HEIC, AVIF), и для видео
-    ///    (MP4, MOV); они различаются по «бренду» после ftyp (и по списку совместимых брендов).
-    ///  * RAW-снимки (CR2, NEF, ARW, DNG) — это TIFF-контейнер, они определяются как Tiff.
-    ///    Определитель вызывается только там, где файл заведомо должен быть другим форматом,
-    ///    так что «чужим расширением» RAW не считается.
+    /// WIC подбирает декодер по содержимому файла, а не по имени. Поэтому явно
+    /// созданный GifBitmapDecoder на таком файле не запускается, а падает:
+    ///     System.IO.FileFormatException: «Кодек не может использовать указанный тип потока»
+    /// (BitmapDecoder сверяет CLSID найденного кодека с ожидаемым, и они не совпадают).
+    ///
+    /// Проверка сигнатуры до создания декодера позволяет заранее понять, что
+    /// анимации не будет, и показать файл обычной картинкой вместо ошибки.
     /// </summary>
-    public static class ImageFormatSniffer
+    internal static class ImageFormatSniffer
     {
-        // Для большинства форматов хватает 16 байт; остальное нужно SVG (ищем тег <svg)
-        // и списку совместимых брендов HEIC/AVIF
-        private const int HeaderLength = 512;
+        /// <summary>Сигнатуры всех известных здесь форматов укладываются в 16 байт.</summary>
+        private const int HeaderSize = 16;
 
         /// <summary>
-        /// Читает начало потока и возвращает его на прежнее место.
-        /// Поток должен поддерживать перемотку (FileStream и MemoryStream подходят).
+        /// Потолок для файлов с неопознанной сигнатурой: попробовать их обычным
+        /// декодером имеет смысл (вдруг в системе стоит сторонний кодек WIC),
+        /// но читать ради этого в память гигабайтный файл — нет.
         /// </summary>
-        public static SniffedFormat Detect(Stream stream)
-        {
-            if (!stream.CanSeek)
-                throw new ArgumentException("The stream must be seekable.", nameof(stream));
+        private const long MaxUnknownProbeBytes = 64L * 1024 * 1024;
 
-            long start = stream.Position;
-            var buffer = new byte[HeaderLength];
-            int read = 0;
+        /// <summary>Читает сигнатуру файла. Недоступный файл — это просто «не знаю».</summary>
+        public static ImageFileFormat Detect(string path)
+        {
             try
             {
-                while (read < buffer.Length)
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite, HeaderSize, FileOptions.SequentialScan);
+                return Detect(stream);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Debug("ImageFormatSniffer.DetectFile", ex);
+                return ImageFileFormat.Unknown;
+            }
+        }
+
+        /// <summary>
+        /// Читает сигнатуру из потока и возвращает его на исходную позицию —
+        /// поток остаётся пригодным для последующего декодирования.
+        /// </summary>
+        public static ImageFileFormat Detect(Stream stream)
+        {
+            if (stream is not { CanRead: true, CanSeek: true }) return ImageFileFormat.Unknown;
+
+            long position = stream.Position;
+            try
+            {
+                stream.Seek(0, SeekOrigin.Begin);
+
+                Span<byte> head = stackalloc byte[HeaderSize];
+                int read = 0;
+                while (read < head.Length)
                 {
-                    int n = stream.Read(buffer, read, buffer.Length - read);
-                    if (n <= 0) break;
-                    read += n;
+                    int chunk = stream.Read(head[read..]);
+                    if (chunk <= 0) break;   // файл короче сигнатуры
+                    read += chunk;
                 }
+
+                return Detect(head[..read]);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Debug("ImageFormatSniffer.DetectStream", ex);
+                return ImageFileFormat.Unknown;
             }
             finally
             {
-                stream.Position = start;
+                try { stream.Seek(position, SeekOrigin.Begin); }
+                catch (Exception ex) { AppLog.Debug("ImageFormatSniffer.Rewind", ex); }
             }
-
-            return Detect(new ReadOnlySpan<byte>(buffer, 0, read));
         }
 
-        /// <summary>Определяет формат по уже прочитанному началу файла.</summary>
-        public static SniffedFormat Detect(ReadOnlySpan<byte> h)
+        /// <summary>Разбор сигнатуры. Вынесен отдельно, чтобы его можно было проверить без файла.</summary>
+        public static ImageFileFormat Detect(ReadOnlySpan<byte> head)
         {
-            if (h.Length < 4) return SniffedFormat.Unknown;
+            if (head.Length < 4) return ImageFileFormat.Unknown;
 
-            if (Match(h, 0, "GIF87a") || Match(h, 0, "GIF89a")) return SniffedFormat.Gif;
+            if (Matches(head, 0, "GIF8")) return ImageFileFormat.Gif;            // GIF87a и GIF89a
+            if (head[0] == 0x89 && Matches(head, 1, "PNG")) return ImageFileFormat.Png;
+            if (head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF) return ImageFileFormat.Jpeg;
+            if (Matches(head, 0, "BM")) return ImageFileFormat.Bmp;
+            if (Matches(head, 0, "8BPS")) return ImageFileFormat.Psd;
+            if (Matches(head, 0, "II") && head[2] == 0x2A && head[3] == 0x00) return ImageFileFormat.Tiff;
+            if (Matches(head, 0, "MM") && head[2] == 0x00 && head[3] == 0x2A) return ImageFileFormat.Tiff;
+            if (head[0] == 0x00 && head[1] == 0x00 && head[2] == 0x01 && head[3] == 0x00) return ImageFileFormat.Ico;
+            if (head[0] == 0x1A && head[1] == 0x45 && head[2] == 0xDF && head[3] == 0xA3) return ImageFileFormat.WebM;
+            if (Matches(head, 0, "PK") && head[2] == 0x03 && head[3] == 0x04) return ImageFileFormat.Archive;
 
-            if (h.Length >= 8 && h[0] == 0x89 && Match(h, 1, "PNG") &&
-                h[4] == 0x0D && h[5] == 0x0A && h[6] == 0x1A && h[7] == 0x0A)
-                return SniffedFormat.Png;
-
-            if (h[0] == 0xFF && h[1] == 0xD8 && h[2] == 0xFF) return SniffedFormat.Jpeg;
-
-            // RIFF-контейнер: внутри WebP или AVI
-            if (Match(h, 0, "RIFF") && h.Length >= 12)
+            if (Matches(head, 0, "RIFF"))
             {
-                if (Match(h, 8, "WEBP")) return SniffedFormat.WebP;
-                if (Match(h, 8, "AVI ")) return SniffedFormat.Avi;
+                if (Matches(head, 8, "WEBP")) return ImageFileFormat.WebP;
+                if (Matches(head, 8, "AVI ")) return ImageFileFormat.Avi;
             }
 
-            // ISO BMFF: HEIC / AVIF / MP4 / MOV
-            if (h.Length >= 12 && Match(h, 4, "ftyp")) return DetectIsoBmff(h);
+            // ISO BMFF — один контейнер и у картинок (HEIC, AVIF), и у видео (MP4, MOV):
+            // различаем по бренду, он идёт сразу за «ftyp»
+            if (Matches(head, 4, "ftyp"))
+            {
+                if (Matches(head, 8, "avif") || Matches(head, 8, "avis")) return ImageFileFormat.Avif;
 
-            // ZIP (в том числе пустой архив и разбитый на тома)
-            if (h[0] == 0x50 && h[1] == 0x4B &&
-                ((h[2] == 0x03 && h[3] == 0x04) ||
-                 (h[2] == 0x05 && h[3] == 0x06) ||
-                 (h[2] == 0x07 && h[3] == 0x08)))
-                return SniffedFormat.Zip;
+                if (Matches(head, 8, "heic") || Matches(head, 8, "heix") ||
+                    Matches(head, 8, "heim") || Matches(head, 8, "heis") ||
+                    Matches(head, 8, "hevc") || Matches(head, 8, "hevx") ||
+                    Matches(head, 8, "mif1") || Matches(head, 8, "msf1")) return ImageFileFormat.Heif;
 
-            // EBML: WebM / Matroska
-            if (h[0] == 0x1A && h[1] == 0x45 && h[2] == 0xDF && h[3] == 0xA3) return SniffedFormat.WebM;
+                return ImageFileFormat.Mp4;   // isom, mp41/42, qt, M4V… — всё это видео
+            }
 
-            if (Match(h, 0, "8BPS")) return SniffedFormat.Psd;
+            if (Matches(head, 0, "<svg") || Matches(head, 0, "<?xml")) return ImageFileFormat.Svg;
 
-            // TIFF (классический и BigTIFF), обе порядка байт
-            if ((h[0] == 0x49 && h[1] == 0x49 && (h[2] == 0x2A || h[2] == 0x2B) && h[3] == 0x00) ||
-                (h[0] == 0x4D && h[1] == 0x4D && h[2] == 0x00 && (h[3] == 0x2A || h[3] == 0x2B)))
-                return SniffedFormat.Tiff;
-
-            // ICO / CUR: 00 00 01|02 00, затем число изображений (не ноль)
-            if (h.Length >= 6 && h[0] == 0x00 && h[1] == 0x00 && (h[2] == 0x01 || h[2] == 0x02) &&
-                h[3] == 0x00 && (h[4] != 0x00 || h[5] != 0x00))
-                return SniffedFormat.Ico;
-
-            // BMP: «BM» мало, поэтому проверяем ещё и зарезервированные поля (байты 6..9 = 0)
-            if (h.Length >= 14 && h[0] == 0x42 && h[1] == 0x4D &&
-                h[6] == 0 && h[7] == 0 && h[8] == 0 && h[9] == 0)
-                return SniffedFormat.Bmp;
-
-            if (LooksLikeSvg(h)) return SniffedFormat.Svg;
-
-            return SniffedFormat.Unknown;
+            return ImageFileFormat.Unknown;
         }
+
+        /// <summary>Название формата для сообщения пользователю.</summary>
+        public static string Describe(ImageFileFormat format) => format switch
+        {
+            ImageFileFormat.Gif => "GIF",
+            ImageFileFormat.Png => "PNG",
+            ImageFileFormat.Jpeg => "JPEG",
+            ImageFileFormat.WebP => "WebP",
+            ImageFileFormat.Bmp => "BMP",
+            ImageFileFormat.Tiff => "TIFF",
+            ImageFileFormat.Heif => "HEIC",
+            ImageFileFormat.Avif => "AVIF",
+            ImageFileFormat.Ico => "ICO",
+            ImageFileFormat.Psd => "PSD",
+            ImageFileFormat.Svg => "SVG",
+            ImageFileFormat.Mp4 => Loc.T("MP4 video", "видео MP4", "vídeo MP4"),
+            ImageFileFormat.WebM => Loc.T("WebM video", "видео WebM", "vídeo WebM"),
+            ImageFileFormat.Avi => Loc.T("AVI video", "видео AVI", "vídeo AVI"),
+            ImageFileFormat.Archive => Loc.T("an archive", "архив", "un archivo comprimido"),
+            _ => Loc.T("an unknown format", "неизвестный формат", "un formato desconocido")
+        };
 
         /// <summary>
-        /// Стоит ли пробовать показать файл как обычную картинку. Видео, архив, SVG и PSD
-        /// WPF всё равно не откроет, а DecodeFullImage сначала читает файл целиком в память:
-        /// на видео в несколько гигабайт это было бы хуже самой ошибки.
-        /// Неизвестный формат пробуем — это может быть редкая картинка (TGA, DDS и т.п.).
+        /// Стоит ли пробовать показать файл обычным декодером WPF.
+        /// Видео, архив и SVG он не покажет, а читать их целиком в память незачем.
         /// </summary>
-        public static bool CanTryStaticImage(SniffedFormat format) => format switch
+        public static bool CanTryStaticImage(ImageFileFormat format, long sizeBytes) => format switch
         {
-            SniffedFormat.Svg or SniffedFormat.Mp4 or SniffedFormat.WebM or
-            SniffedFormat.Avi or SniffedFormat.Zip or SniffedFormat.Psd => false,
+            ImageFileFormat.Mp4 or ImageFileFormat.WebM or ImageFileFormat.Avi
+                or ImageFileFormat.Archive or ImageFileFormat.Svg => false,
+            ImageFileFormat.Unknown => sizeBytes <= MaxUnknownProbeBytes,
             _ => true
         };
 
-        /// <summary>Название формата для сообщения пользователю («видео MP4», «архив ZIP»…).</summary>
-        public static string Describe(SniffedFormat format) => format switch
+        /// <summary>
+        /// Пояснение для сообщения об ошибке, когда содержимое не совпадает с расширением.
+        /// Пустая строка — расширение честное либо формат не опознан.
+        /// </summary>
+        public static string DescribeMismatch(string path)
         {
-            SniffedFormat.Mp4 => Loc.T("MP4/MOV video", "видео MP4/MOV", "vídeo MP4/MOV"),
-            SniffedFormat.WebM => Loc.T("WebM/MKV video", "видео WebM/MKV", "vídeo WebM/MKV"),
-            SniffedFormat.Avi => Loc.T("AVI video", "видео AVI", "vídeo AVI"),
-            SniffedFormat.Zip => Loc.T("ZIP archive", "архив ZIP", "archivo ZIP"),
-            SniffedFormat.Svg => Loc.T("SVG vector image", "векторная картинка SVG", "imagen vectorial SVG"),
-            SniffedFormat.Psd => Loc.T("Photoshop image (PSD)", "изображение Photoshop (PSD)", "imagen de Photoshop (PSD)"),
-            SniffedFormat.Heic => string.Format(Loc.T("{0} image", "изображение {0}", "imagen {0}"), "HEIC/HEIF"),
-            SniffedFormat.Unknown => Loc.T("an unknown format", "неизвестный формат", "un formato desconocido"),
-            _ => string.Format(Loc.T("{0} image", "изображение {0}", "imagen {0}"), ShortName(format))
+            var actual = Detect(path);
+            if (actual == ImageFileFormat.Unknown) return "";
+
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            if (ExtensionFits(actual, ext)) return "";
+
+            string name = Describe(actual);
+            return Loc.T($" \u2014 the file is actually {name}",
+                         $" \u2014 на самом деле это {name}",
+                         $" \u2014 en realidad es {name}");
+        }
+
+        private static bool ExtensionFits(ImageFileFormat format, string ext) => format switch
+        {
+            ImageFileFormat.Gif => ext == ".gif",
+            ImageFileFormat.Png => ext is ".png" or ".apng",
+            ImageFileFormat.Jpeg => ext is ".jpg" or ".jpeg" or ".jfif",
+            ImageFileFormat.WebP => ext == ".webp",
+            ImageFileFormat.Bmp => ext is ".bmp" or ".dib",
+            // RAW-снимки (CR2, NEF, ARW, DNG…) — это тоже контейнер TIFF,
+            // чужим расширением их считать нельзя
+            ImageFileFormat.Tiff => ext is ".tif" or ".tiff" or ".cr2" or ".nef" or ".arw"
+                or ".dng" or ".orf" or ".rw2" or ".pef" or ".srw",
+            ImageFileFormat.Heif => ext is ".heic" or ".heif" or ".hif",
+            ImageFileFormat.Avif => ext == ".avif",
+            ImageFileFormat.Ico => ext is ".ico" or ".cur",
+            ImageFileFormat.Psd => ext == ".psd",
+            ImageFileFormat.Svg => ext == ".svg",
+            _ => false
         };
 
-        private static string ShortName(SniffedFormat format) => format switch
+        private static bool Matches(ReadOnlySpan<byte> data, int offset, string ascii)
         {
-            SniffedFormat.Gif => "GIF",
-            SniffedFormat.Png => "PNG",
-            SniffedFormat.Jpeg => "JPEG",
-            SniffedFormat.WebP => "WebP",
-            SniffedFormat.Bmp => "BMP",
-            SniffedFormat.Tiff => "TIFF",
-            SniffedFormat.Avif => "AVIF",
-            SniffedFormat.Ico => "ICO",
-            _ => format.ToString()
-        };
+            if (offset < 0 || offset + ascii.Length > data.Length) return false;
 
-        // ------------------------------------------------------------- внутреннее
-
-        /// <summary>Различает картинки (HEIC/AVIF) и видео (MP4/MOV) по «бренду» после ftyp.</summary>
-        private static SniffedFormat DetectIsoBmff(ReadOnlySpan<byte> h)
-        {
-            string brand = Encoding.ASCII.GetString(h.Slice(8, 4));
-
-            switch (brand)
-            {
-                case "avif":
-                case "avis":
-                    return SniffedFormat.Avif;
-
-                case "heic":
-                case "heix":
-                case "hevc":
-                case "hevx":
-                case "heim":
-                case "heis":
-                case "hevm":
-                case "hevs":
-                    return SniffedFormat.Heic;
-
-                case "mif1":
-                case "msf1":
-                    // Общий «картиночный» бренд: AVIF прячется в списке совместимых брендов
-                    return CompatibleBrandsContain(h, "avif", "avis")
-                        ? SniffedFormat.Avif
-                        : SniffedFormat.Heic;
-
-                default:
-                    return SniffedFormat.Mp4; // isom, mp41, mp42, qt, M4V, 3gp... — видео/аудио
-            }
-        }
-
-        /// <summary>Список совместимых брендов: после major (8..11) и minor (12..15) идут по 4 байта.</summary>
-        private static bool CompatibleBrandsContain(ReadOnlySpan<byte> h, string first, string second)
-        {
-            // размер блока ftyp — первые 4 байта, big-endian
-            long boxSize = ((long)h[0] << 24) | ((long)h[1] << 16) | ((long)h[2] << 8) | h[3];
-            int end = (int)Math.Min(boxSize <= 0 ? h.Length : boxSize, h.Length);
-
-            for (int offset = 16; offset + 4 <= end; offset += 4)
-            {
-                if (Match(h, offset, first) || Match(h, offset, second)) return true;
-            }
-            return false;
-        }
-
-        private static bool LooksLikeSvg(ReadOnlySpan<byte> h)
-        {
-            int i = 0;
-
-            // UTF-8 BOM
-            if (h.Length >= 3 && h[0] == 0xEF && h[1] == 0xBB && h[2] == 0xBF) i = 3;
-
-            // пробелы и переводы строк в начале
-            while (i < h.Length && (h[i] == 0x20 || h[i] == 0x09 || h[i] == 0x0A || h[i] == 0x0D)) i++;
-
-            if (i >= h.Length || h[i] != (byte)'<') return false;
-
-            // <svg ...> или <?xml ...?> с тегом <svg где-то дальше (после DOCTYPE и комментариев)
-            return Encoding.ASCII.GetString(h.Slice(i)).Contains("<svg", StringComparison.OrdinalIgnoreCase);
-        }
-
-        /// <summary>Сравнивает байты начиная с offset с ASCII-строкой.</summary>
-        private static bool Match(ReadOnlySpan<byte> h, int offset, string ascii)
-        {
-            if (h.Length < offset + ascii.Length) return false;
             for (int i = 0; i < ascii.Length; i++)
-            {
-                if (h[offset + i] != (byte)ascii[i]) return false;
-            }
+                if (data[offset + i] != (byte)ascii[i]) return false;
+
             return true;
         }
     }

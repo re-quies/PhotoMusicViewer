@@ -5,6 +5,16 @@ using System.Windows.Media.Imaging;
 
 namespace PhotoMusicViewer.Services
 {
+    /// <summary>Как обрезать JPEG.</summary>
+    public enum CropMethod
+    {
+        /// <summary>Без перекодирования (jpegtran): ни потерь качества, ни потерь метаданных;
+        /// левый и верхний край сдвигаются к сетке JPEG (8 или 16 пикселей).</summary>
+        Lossless,
+        /// <summary>Точно по рамке, с перекодированием (качество 95); метаданные переносятся.</summary>
+        Reencode
+    }
+
     public static class CropAndSaveService
     {
         /// <summary>
@@ -16,21 +26,54 @@ namespace PhotoMusicViewer.Services
             return ext is ".jpg" or ".jpeg" or ".jfif" or ".png" or ".bmp" or ".tiff" or ".tif";
         }
 
+        /// <summary>Совместимая точка входа: перекодирование, версия файла — на момент вызова.</summary>
+        public static string CropAndSave(string path, Int32Rect cropRect, bool replaceOriginal, FileOperationContext? operation = null) =>
+            Save(path, cropRect, replaceOriginal, CropMethod.Reencode, null, operation);
+
         /// <summary>
         /// Обрезает изображение по прямоугольнику (в пикселях с уже применённой
         /// EXIF-ориентацией — как на экране) и сохраняет.
-        /// replaceOriginal = true  — атомарно заменяет исходный файл;
-        /// replaceOriginal = false — сохраняет копию "имя (cropped).ext".
+        ///
+        /// replaceOriginal = true — замена через ImageSaveWriter, как у поворота: рядом
+        /// остаётся точная копия оригинала *.pmv-original-….bak, в этом сеансе работает
+        /// кнопка «Вернуть оригинал». Раньше обрезка удаляла копию сразу после записи.
+        /// replaceOriginal = false — копия «имя (cropped).ext».
+        ///
+        /// expectedVersion — версия файла на момент начала обрезки. Если файл с тех пор
+        /// изменился (OneDrive, другой редактор), ничего не сохраняется: рамка относилась
+        /// к другому снимку. Та же проверка повторяется прямо перед записью.
+        ///
         /// Для форматов без энкодера (webp/gif/heic/raw) копия сохраняется как PNG.
         /// Возвращает путь к сохранённому файлу.
         /// </summary>
-        public static string CropAndSave(string path, Int32Rect cropRect, bool replaceOriginal)
+        internal static string Save(string path, Int32Rect cropRect, bool replaceOriginal, CropMethod method,
+            FileVersion? expectedVersion, FileOperationContext? operation = null)
         {
+            path = Path.GetFullPath(path);
+            var version = FileVersion.Read(path);
+            if (expectedVersion is { } expected && expected != version)
+                throw new IOException(Loc.T(
+                    "The file changed after cropping started (for example, synced by OneDrive). Nothing was saved — open it again and repeat the crop.",
+                    "Файл изменился после начала обрезки (например, его обновил OneDrive). Ничего не сохранено — откройте его заново и повторите обрезку.",
+                    "El archivo cambió después de empezar el recorte (p. ej., OneDrive). No se guardó nada: ábralo de nuevo y repita el recorte."));
+            var token = operation?.Token ?? default;
+
+            if (JpegLossless.IsJpeg(path) && method == CropMethod.Lossless)
+            {
+                operation?.Checkpoint(FileOperationStage.Encoding);
+                var rect = new JpegLossless.PixelRect(cropRect.X, cropRect.Y, cropRect.Width, cropRect.Height);
+                return ImageSaveWriter.Write(path, copy: !replaceOriginal, " (cropped)",
+                    output => JpegLossless.Crop(path, output, rect, token), operation, version);
+            }
+
             // Рамка обрезки задана относительно того, что видит пользователь,
             // поэтому берём пиксели с уже применённой EXIF-ориентацией.
             // SafeImageDecoder переживает файлы с битым EXIF: раньше такой снимок
             // валился с «Непредвиденный тип или значение свойства», хотя открывался.
-            var source = SafeImageDecoder.LoadOriented(path);
+            operation?.Checkpoint(FileOperationStage.Decoding);
+            var source = ImageFormatSniffer.Detect(path) == ImageFileFormat.Gif
+                ? GifAnimator.LoadFirstFrameForEditingWithToken(path, token)
+                : SafeImageDecoder.LoadDecoded(path, 0, rejectMultiPageTiff: replaceOriginal, token: token).Image;
 
             // Страховка: не выходим за границы изображения
             int x = Math.Clamp(cropRect.X, 0, source.PixelWidth - 1);
@@ -44,6 +87,7 @@ namespace PhotoMusicViewer.Services
             var ext = Path.GetExtension(path).ToLowerInvariant();
             string saveExt = ext;
             BitmapEncoder encoder;
+            bool jpeg = false;
 
             switch (ext)
             {
@@ -51,6 +95,7 @@ namespace PhotoMusicViewer.Services
                 case ".jpeg":
                 case ".jfif":
                     encoder = new JpegBitmapEncoder { QualityLevel = 95 };
+                    jpeg = true;
                     break;
                 case ".png":
                     encoder = new PngBitmapEncoder();
@@ -71,44 +116,50 @@ namespace PhotoMusicViewer.Services
                     break;
             }
 
+            operation?.Checkpoint(FileOperationStage.Encoding);
             encoder.Frames.Add(BitmapFrame.Create(cropped));
 
-            if (replaceOriginal)
-            {
-                // Замена через временный файл — как в RotateAndSaveService
-                SafeFileReplace.WriteThenReplace(path, stream => encoder.Save(stream));
-                return path;
-            }
+            Action<Stream> write = jpeg
+                ? output => WriteJpegWithMetadata(path, encoder, output, w, h, token)
+                : output => encoder.Save(output);
+
+            if (saveExt == ext)
+                return ImageSaveWriter.Write(path, copy: !replaceOriginal, " (cropped)", write, operation, version);
 
             var dir = Path.GetDirectoryName(path)!;
             var name = Path.GetFileNameWithoutExtension(path);
-            var newPath = GetAvailablePath(Path.Combine(dir, name + " (cropped)" + saveExt));
-
-            using (var stream = new FileStream(newPath, FileMode.Create, FileAccess.Write))
+            return SafeFileReplace.WriteCopyWithOperation(Path.Combine(dir, name + " (cropped)" + saveExt), stream =>
             {
-                encoder.Save(stream);
-            }
-
-            return newPath;
+                write(stream);
+                if (FileVersion.Read(path) != version) throw new IOException("Source changed during editing. No copy was saved.");
+            }, operation);
         }
 
-        private static string GetAvailablePath(string path)
+        /// <summary>
+        /// Перекодированный JPEG + метаданные оригинала (дата съёмки, GPS, камера, ICC, XMP, IPTC).
+        /// Если перенос не удался, файл всё равно сохраняется, но без метаданных — с записью в журнал.
+        /// </summary>
+        private static void WriteJpegWithMetadata(string path, BitmapEncoder encoder, Stream output, int width, int height, System.Threading.CancellationToken token)
         {
-            if (!File.Exists(path)) return path;
-
-            var dir = Path.GetDirectoryName(path)!;
-            var name = Path.GetFileNameWithoutExtension(path);
-            var ext = Path.GetExtension(path);
-            int counter = 1;
-
-            string candidate;
-            do
+            using var encoded = new MemoryStream();
+            encoder.Save(encoded);
+            long start = output.Position;
+            try
             {
-                candidate = Path.Combine(dir, $"{name} ({counter}){ext}");
-                counter++;
-            } while (File.Exists(candidate));
-
-            return candidate;
+                using var original = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                encoded.Position = 0;
+                JpegMetadataTransplant.Merge(original, encoded, output, width, height, token);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or OverflowException && ex is not OperationCanceledException)
+            {
+                AppLog.Warn("CropAndSaveService.Metadata", ex, AppLog.Describe(path));
+                output.Position = start; output.SetLength(start);
+                encoded.Position = 0; encoded.CopyTo(output);
+            }
         }
+
+        // Совместимая точка входа для прежних регрессионных тестов.
+        internal static string WriteCopyWithoutOverwrite(string path, Action<Stream> write) =>
+            SafeFileReplace.WriteCopyWithoutOverwrite(path, write);
     }
 }

@@ -158,11 +158,7 @@
             <StackPanel Grid.Column="3" Orientation="Horizontal">
                 <Button x:Name="AddFolderButton" Content="Add Folder" Margin="4,4"
                         Click="AddFolderButton_Click" Focusable="False" IsTabStop="False"/>
-                <!-- Кнопка открывает страницу GitHub разработчика.
-                     Ссылка задаётся в MusicView.xaml.cs -> DeveloperGitHubUrl -->
-                <Button x:Name="GitHubButton" Content="GitHub" Margin="4,4"
-                        ToolTip="Open the developer's GitHub page"
-                        Click="GitHubButton_Click" Focusable="False" IsTabStop="False"/>
+                <!-- Ссылка на GitHub перенесена в настройки (раздел «О программе»). -->
             </StackPanel>
 
             <ComboBox x:Name="SortModeCombo" Grid.Column="4" Width="110" Margin="4,4"

@@ -14,12 +14,23 @@ namespace PhotoMusicViewer
 
             AppLog.Info("App.Startup");
 
+            // Остатки записи после аварии (диспетчер задач, пропало питание): пути в журнале
+            // зашифрованы DPAPI; уборка — в фоне, запуск не задерживает.
+            TempArtifactJournal.Protect = SecretProtector.Protect;
+            TempArtifactJournal.Unprotect = SecretProtector.Unprotect;
+            _ = Task.Run(() =>
+            {
+                try { TempArtifactJournal.CleanupAbandoned(); }
+                catch (Exception ex) { AppLog.Warn("App.CleanupAbandoned", ex); }
+            });
+
+            // Язык — до создания окон, чтобы интерфейс сразу открылся на нужном языке.
+            Loc.SetLanguage(Loc.ResolveStartup(AppPreferences.Current.Language));
+            // Переключение кнопкой EN/RU/ES запоминается, если это включено в настройках.
+            Loc.LanguageChanged += () => AppPreferences.RememberLanguage(Loc.ToStartup(Loc.Language));
+
             // Настройки перевода читаются с диска только если пользователь сам включил сохранение
             TranslationConfig.LoadFromDiskIfPresent();
-
-            // Язык интерфейса при запуске (выбирается в настройках). Включаем до создания окон,
-            // чтобы они сразу строились на нужном языке; промты по умолчанию подстроятся сами
-            AppSettings.ApplyStartupLanguage();
 
             // Ловим исключения из UI-потока (не приводят к мгновенному краху, но покажем причину)
             DispatcherUnhandledException += (_, args) =>
@@ -51,10 +62,24 @@ namespace PhotoMusicViewer
 
             if (e.Args.Length > 0)
             {
+                // Самый частый способ открытия — двойной клик в Проводнике. Проводник сам
+                // записывает файл в «Недавние», поэтому чистим так же, как после диалога
+                // открытия и перетаскивания — если пользователь включил уборку в настройках
+                // (по умолчанию выключена, тогда вызов ничего не делает).
+                RecentTracesService.EraseAfterShellLaunch(e.Args[0]);
                 window.OpenFileOnStartup(e.Args[0]);
             }
 
             window.Show();
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            // Скопированное приложением (и картинка, и текст) не переживает выход,
+            // если пользователь с тех пор не скопировал в буфер что-то своё.
+            PrivacyClipboard.ClearOwnedContent();
+            RecentTracesService.FinishPendingShellLaunchErase();
+            base.OnExit(e);
         }
     }
 }

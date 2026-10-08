@@ -3,8 +3,9 @@ using System;
 namespace PhotoMusicViewer.Services
 {
     /// <summary>
-    /// Простейшая локализация без файлов настроек и реестра:
-    /// выбранный язык живёт только в памяти процесса (приватность и простота).
+    /// Простейшая локализация без реестра. Язык при запуске выбирается в настройках
+    /// (AppPreferences: «как в Windows» или конкретный язык, по желанию — последний
+    /// выбранный кнопкой EN/RU/ES).
     /// </summary>
     public static class Loc
     {
@@ -26,41 +27,40 @@ namespace PhotoMusicViewer.Services
         /// <summary>Переключает язык по кругу: EN -> RU -> ES -> EN.</summary>
         public static void Toggle()
         {
-            SetLanguage(Language switch
+            Language = Language switch
             {
                 AppLanguage.English => AppLanguage.Russian,
                 AppLanguage.Russian => AppLanguage.Spanish,
                 _ => AppLanguage.English
-            });
+            };
+            LanguageChanged?.Invoke();
         }
 
-        /// <summary>Устанавливает язык; событие срабатывает только если язык действительно сменился.</summary>
+        /// <summary>Включает язык (событие — только если он действительно сменился).</summary>
         public static void SetLanguage(AppLanguage language)
         {
-            if (Language == language) return;
-
+            if (!Enum.IsDefined(language) || Language == language) return;
             Language = language;
             LanguageChanged?.Invoke();
         }
 
-        /// <summary>Язык интерфейса Windows, если он поддерживается (иначе английский).</summary>
-        public static AppLanguage DetectSystemLanguage()
+        public static AppLanguage FromStartup(StartupLanguage language) => language switch
         {
-            try
-            {
-                return System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.ToLowerInvariant() switch
-                {
-                    "ru" => AppLanguage.Russian,
-                    "es" => AppLanguage.Spanish,
-                    _ => AppLanguage.English
-                };
-            }
-            catch (Exception ex)
-            {
-                AppLog.Debug("Loc.DetectSystemLanguage", ex);
-                return AppLanguage.English;
-            }
-        }
+            StartupLanguage.Russian => AppLanguage.Russian,
+            StartupLanguage.Spanish => AppLanguage.Spanish,
+            _ => AppLanguage.English
+        };
+
+        public static StartupLanguage ToStartup(AppLanguage language) => language switch
+        {
+            AppLanguage.Russian => StartupLanguage.Russian,
+            AppLanguage.Spanish => StartupLanguage.Spanish,
+            _ => StartupLanguage.English
+        };
+
+        /// <summary>Язык при запуске по настройкам; «как в Windows» — по языку интерфейса системы.</summary>
+        public static AppLanguage ResolveStartup(StartupLanguage language) =>
+            FromStartup(AppPreferences.Resolve(language, System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName));
 
         /// <summary>Возвращает строку на текущем языке.</summary>
         public static string T(string en, string ru, string es) => Language switch

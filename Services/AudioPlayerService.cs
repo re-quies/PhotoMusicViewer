@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Windows.Media;
 using System.Windows.Threading;
 using NAudio.Wave;
@@ -10,7 +11,7 @@ namespace PhotoMusicViewer.Services
     {
         private enum Backend { MediaPlayer, NAudio }
 
-        private readonly MediaPlayer _mediaPlayer = new();
+        private MediaPlayer _mediaPlayer = new();
         private readonly DispatcherTimer _positionTimer = new();
 
         private WaveOutEvent? _waveOut;
@@ -19,6 +20,9 @@ namespace PhotoMusicViewer.Services
 
         private Backend _backend = Backend.MediaPlayer;
         private bool _isPlaying;
+        private bool _isLoaded;
+        private bool _isLoading;
+        private bool _playRequested;
         private double _volume = 0.8;
         private double _speed = 1.0;
         private TimeSpan? _pendingSeek;
@@ -27,33 +31,65 @@ namespace PhotoMusicViewer.Services
         public event Action<TimeSpan, TimeSpan>? PositionChanged; // current, total
 
         public bool IsPlaying => _isPlaying;
+        public bool IsLoading => _isLoading;
+        public bool CanPlay => _isLoaded || _isLoading;
+        public bool IsPlayPending => _isLoading && _playRequested;
+        public event Action? PlaybackStateChanged;
 
         public AudioPlayerService()
         {
-            _mediaPlayer.MediaOpened += (_, _) =>
-            {
-                if (_pendingSeek.HasValue)
-                {
-                    _mediaPlayer.Position = _pendingSeek.Value;
-                    _pendingSeek = null;
-                }
-            };
-
-            _mediaPlayer.MediaEnded += (_, _) =>
-            {
-                _isPlaying = false;
-                _positionTimer.Stop();
-                TrackEnded?.Invoke();
-            };
-            _mediaPlayer.MediaFailed += (_, args) =>
-{
-    _isPlaying = false;
-    _positionTimer.Stop();
-    PlaybackError?.Invoke(Loc.T("MediaPlayer failed to play file", "MediaPlayer не смог воспроизвести файл", "MediaPlayer no pudo reproducir el archivo") + $": {args.ErrorException}");
-};
+            HookMediaPlayer(_mediaPlayer);
 
             _positionTimer.Interval = TimeSpan.FromMilliseconds(250);
             _positionTimer.Tick += (_, _) => ReportPosition();
+        }
+
+        private void HookMediaPlayer(MediaPlayer player)
+        {
+            // Каждый Open использует отдельный объект: события старого файла
+            // после переключения трека не изменяют состояние нового.
+            player.MediaOpened += (_, _) =>
+            {
+                if (!ReferenceEquals(player, _mediaPlayer) ||
+                    _backend != Backend.MediaPlayer || !_isLoading) return;
+                _isLoading = false;
+                _isLoaded = true;
+                try
+                {
+                    if (_pendingSeek.HasValue)
+                    {
+                        player.Position = _pendingSeek.Value;
+                        _pendingSeek = null;
+                    }
+                    if (_playRequested) Play();
+                    else SetPlaying(false);
+                }
+                catch (Exception ex)
+                {
+                    StopInternalPlayback();
+                    PlaybackError?.Invoke(Loc.T("Failed to open audio", "Не удалось открыть аудио", "No se pudo abrir el audio") + $": {ex.Message}");
+                }
+            };
+            player.MediaEnded += (_, _) =>
+            {
+                if (!ReferenceEquals(player, _mediaPlayer) || _backend != Backend.MediaPlayer || !_isLoaded) return;
+                SetPlaying(false);
+                TrackEnded?.Invoke();
+            };
+            player.MediaFailed += (_, args) =>
+            {
+                if (!ReferenceEquals(player, _mediaPlayer) || _backend != Backend.MediaPlayer || !CanPlay) return;
+                StopInternalPlayback();
+                PlaybackError?.Invoke(Loc.T("MediaPlayer failed to play file", "MediaPlayer не смог воспроизвести файл", "MediaPlayer no pudo reproducir el archivo") + $": {args.ErrorException}");
+            };
+        }
+
+        private void SetPlaying(bool playing)
+        {
+            _isPlaying = playing;
+            if (playing) _positionTimer.Start();
+            else _positionTimer.Stop();
+            PlaybackStateChanged?.Invoke();
         }
 
         public event Action<string>? PlaybackError;
@@ -61,15 +97,17 @@ namespace PhotoMusicViewer.Services
         /// <summary>Некритичные уведомления (например, очень длинная Opus-запись загружена не целиком).</summary>
         public event Action<string>? PlaybackNotice;
 
-public void Load(string path)
+/// <summary>NAudio: true после инициализации. MediaPlayer: true означает,
+/// что Open принят; готовность/ошибка приходят асинхронно через события.</summary>
+public bool Load(string path)
 {
     StopInternalPlayback();
-    _pendingSeek = null;
-
-    var ext = System.IO.Path.GetExtension(path).ToLowerInvariant();
-
     try
     {
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Audio path is empty.", nameof(path));
+        path = Path.GetFullPath(path);
+        if (!File.Exists(path)) throw new FileNotFoundException("Audio file does not exist.", path);
+        var ext = Path.GetExtension(path).ToLowerInvariant();
         if (ext == ".ogg" || ext == ".opus")
         {
             _backend = Backend.NAudio;
@@ -87,21 +125,8 @@ public void Load(string path)
                 _naudioReader = new OpusFileReader(path);
             }
 
-            // Очень длинная запись может не поместиться в буфер целиком -
-            // сообщаем об этом явно вместо прежней молчаливой обрезки
-            if (_naudioReader is OpusFileReader opusReader)
-            {
-                opusReader.Truncated += loadedDuration => PlaybackNotice?.Invoke(Loc.T(
-                    "This recording is very long. Only the first " +
-                    $"{(int)loadedDuration.TotalMinutes} minutes were loaded; " +
-                    "playback beyond that point isn't available.",
-                    "Эта запись очень длинная. Загружены только первые " +
-                    $"{(int)loadedDuration.TotalMinutes} мин.; " +
-                    "воспроизведение дальше этой точки недоступно.",
-                    "Esta grabación es muy larga. Solo se cargaron los primeros " +
-                    $"{(int)loadedDuration.TotalMinutes} min; " +
-                    "la reproducción más allá de ese punto no está disponible."));
-            }
+            // Opus теперь потоковый, без ограничения длительности по размеру PCM.
+            // Ошибка Read/LastError поступит в WaveOut_PlaybackStopped и PlaybackError.
 
             _waveOut = new WaveOutEvent();
             // Регулировка скорости: ридер оборачивается в ресемплер (см. SpeedSampleProvider).
@@ -110,107 +135,139 @@ public void Load(string path)
             _waveOut.Init(_speedProvider);
             _waveOut.Volume = (float)_volume;
             _waveOut.PlaybackStopped += WaveOut_PlaybackStopped;
+            _isLoaded = true;
         }
         else
         {
             _backend = Backend.MediaPlayer;
-            _mediaPlayer.Open(new Uri(path, UriKind.Absolute));
+            _mediaPlayer = new MediaPlayer();
+            HookMediaPlayer(_mediaPlayer);
             _mediaPlayer.Volume = _volume;
             _mediaPlayer.SpeedRatio = _speed;
+            _isLoading = true;
+            _mediaPlayer.Open(new Uri(path, UriKind.Absolute));
         }
+        PlaybackStateChanged?.Invoke();
+        return CanPlay;
     }
     catch (Exception ex)
     {
+        StopInternalPlayback();
         AppLog.Error("AudioPlayerService.Load", ex, AppLog.Describe(path));
         PlaybackError?.Invoke(Loc.T("Failed to load", "Не удалось загрузить", "No se pudo cargar") + $" '{System.IO.Path.GetFileName(path)}': {ex}");
+        return false;
     }
 }
 
         private void WaveOut_PlaybackStopped(object? sender, StoppedEventArgs e)
-{
-    if (e.Exception != null)
-    {
-        PlaybackError?.Invoke(Loc.T("Playback error", "Ошибка воспроизведения", "Error de reproducción") + $": {e.Exception}");
-        _isPlaying = false;
-        _positionTimer.Stop();
-        return;
-    }
+        {
+            if (!_positionTimer.Dispatcher.CheckAccess())
+            {
+                _positionTimer.Dispatcher.BeginInvoke(new Action(() => WaveOut_PlaybackStopped(sender, e)));
+                return;
+            }
+            if (!ReferenceEquals(sender, _waveOut) || _backend != Backend.NAudio) return;
+            if (e.Exception != null)
+            {
+                StopInternalPlayback();
+                PlaybackError?.Invoke(Loc.T("Playback error", "Ошибка воспроизведения", "Error de reproducción") + $": {e.Exception}");
+                return;
+            }
+            if (_naudioReader != null && _naudioReader.Position >= _naudioReader.Length)
+            {
+                SetPlaying(false);
+                TrackEnded?.Invoke();
+            }
+        }
 
-    if (_naudioReader != null && _naudioReader.Position >= _naudioReader.Length)
-    {
-        _isPlaying = false;
-        _positionTimer.Stop();
-        TrackEnded?.Invoke();
-    }
-}
-
-        public void Play()
-{
-    try
-    {
-        if (_backend == Backend.NAudio) _waveOut?.Play();
-        else _mediaPlayer.Play();
-
-        _isPlaying = true;
-        _positionTimer.Start();
-    }
-    catch (Exception ex)
-    {
-        AppLog.Error("AudioPlayerService.Play", ex);
-        PlaybackError?.Invoke(Loc.T("Failed to start playback", "Не удалось начать воспроизведение", "No se pudo iniciar la reproducción") + $": {ex}");
-    }
-}
+        /// <summary>Возвращает false, если файл не загружен или запуск
+        /// не удался. Пока MediaPlayer открывает файл, ставит запрос в очередь,
+        /// но IsPlaying остаётся false до MediaOpened и успешного Play.</summary>
+        public bool Play()
+        {
+            if (_isLoading)
+            {
+                _playRequested = true;
+                return true;
+            }
+            if (!_isLoaded || (_backend == Backend.NAudio && _waveOut == null)) return false;
+            try
+            {
+                if (_backend == Backend.NAudio) _waveOut!.Play();
+                else _mediaPlayer.Play();
+                _playRequested = false;
+                SetPlaying(true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                StopInternalPlayback();
+                AppLog.Error("AudioPlayerService.Play", ex);
+                PlaybackError?.Invoke(Loc.T("Failed to start playback", "Не удалось начать воспроизведение", "No se pudo iniciar la reproducción") + $": {ex}");
+                return false;
+            }
+        }
 
         public void Pause()
         {
-            if (_backend == Backend.NAudio) _waveOut?.Pause();
-            else _mediaPlayer.Pause();
-
-            _isPlaying = false;
-            _positionTimer.Stop();
+            _playRequested = false;
+            if (_isLoaded)
+            {
+                if (_backend == Backend.NAudio) _waveOut?.Pause();
+                else _mediaPlayer.Pause();
+            }
+            SetPlaying(false);
         }
 
-        public void Stop()
-        {
-            StopInternalPlayback();
-            _isPlaying = false;
-            _positionTimer.Stop();
-        }
+        public void Stop() => StopInternalPlayback();
 
-        /// <summary>
-        /// Полностью освобождает открытый файл (в отличие от Stop, который держит его открытым).
-        /// Нужно перед переименованием играющего трека и при очистке плейлиста.
-        /// </summary>
-        public void Unload()
-        {
-            StopInternalPlayback();
-            _mediaPlayer.Close();
-            _isPlaying = false;
-            _positionTimer.Stop();
-        }
+        /// <summary>Освобождает открытый файл перед переименованием/очисткой.</summary>
+        public void Unload() => StopInternalPlayback();
 
         private void StopInternalPlayback()
-{
-    if (_waveOut != null)
-    {
-        _waveOut.PlaybackStopped -= WaveOut_PlaybackStopped;
-        _waveOut.Stop();
-        _waveOut.Dispose();
-        _waveOut = null;
-    }
-    _naudioReader?.Dispose();
-    _naudioReader = null;
-    _speedProvider = null;
-
-    _mediaPlayer.Stop();
-}
+        {
+            _isLoaded = _isLoading = _playRequested = false;
+            _pendingSeek = null;
+            var waveOut = _waveOut;
+            _waveOut = null;
+            var reader = _naudioReader;
+            _naudioReader = null;
+            _speedProvider = null;
+            // Opus поддерживает конкурентную отмену: прекращаем длинную перемотку
+            // до ожидания устройства. Остальные ридеры освобождаем после WaveOut.
+            if (reader is OpusFileReader)
+            {
+                try { reader.Dispose(); }
+                catch (Exception ex) { AppLog.Debug("AudioPlayerService.DisposeReader", ex); }
+            }
+            if (waveOut != null)
+            {
+                waveOut.PlaybackStopped -= WaveOut_PlaybackStopped;
+                try { waveOut.Stop(); }
+                catch (Exception ex) { AppLog.Debug("AudioPlayerService.Stop", ex); }
+                try { waveOut.Dispose(); }
+                catch (Exception ex) { AppLog.Debug("AudioPlayerService.DisposeWaveOut", ex); }
+            }
+            if (reader is not OpusFileReader)
+            {
+                try { reader?.Dispose(); }
+                catch (Exception ex) { AppLog.Debug("AudioPlayerService.DisposeReader", ex); }
+            }
+            try { _mediaPlayer.Close(); }
+            catch (Exception ex) { AppLog.Debug("AudioPlayerService.Close", ex); }
+            SetPlaying(false);
+        }
 
         public void SeekTo(TimeSpan position)
 {
+    if (!CanPlay) return;
     if (_backend == Backend.NAudio && _naudioReader != null)
     {
-        _naudioReader.CurrentTime = position;
-        _speedProvider?.Reset(); // выбрасываем уже прочитанный "хвост" старых данных
+        var reader = _naudioReader;
+        var provider = _speedProvider;
+        if (provider == null) return;
+        // Read не может вклиниться между изменением позиции и сбросом буфера.
+        provider.Seek(() => reader.CurrentTime = position);
     }
     else if (_mediaPlayer.NaturalDuration.HasTimeSpan)
     {
@@ -249,7 +306,7 @@ public void Load(string path)
             }
         }
 
-        public TimeSpan Position => _backend == Backend.NAudio && _naudioReader != null
+        public TimeSpan Position => !CanPlay ? TimeSpan.Zero : _backend == Backend.NAudio && _naudioReader != null
     ? _naudioReader.CurrentTime
     : _mediaPlayer.Position;
 
@@ -257,6 +314,7 @@ public void Load(string path)
 {
     get
     {
+        if (!_isLoaded) return null;
         if (_backend == Backend.NAudio && _naudioReader != null)
             return _naudioReader.TotalTime;
 

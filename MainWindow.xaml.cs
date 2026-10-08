@@ -86,7 +86,7 @@ private void SwitchToMusic()
             e.Handled = true;
 
             // Перетаскивание тоже может оставить след в "Недавних файлах" - чистим, как и после диалога открытия
-            PrivacyCleanupService.RemoveFromRecentItems(path);
+            RecentTracesService.Erase(path);
 
             var ext = Path.GetExtension(path).ToLowerInvariant();
             if (AudioExtensions.Contains(ext))

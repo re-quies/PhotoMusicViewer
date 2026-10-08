@@ -30,6 +30,8 @@ namespace PhotoMusicViewer.Services
         private double _phase;   // дробная позиция между _frameA и _frameB [0..1)
         private bool _primed;    // прочитаны ли стартовые кадры
         private bool _sourceEnded;
+        private bool _lastFrame;
+        private bool _finished;
         private double _speed = 1.0;
         private readonly object _lock = new();
 
@@ -53,40 +55,65 @@ namespace PhotoMusicViewer.Services
             set { lock (_lock) _speed = Math.Clamp(value, MinSpeed, MaxSpeed); }
         }
 
-        /// <summary>Сбрасывает внутренние буферы (вызывается после перемотки источника).</summary>
+        /// <summary>Сбрасывает только буферы. Для перемотки используйте Seek:
+        /// изменение позиции источника и сброс должны быть одной операцией.</summary>
         public void Reset()
         {
+            lock (_lock) ResetCore();
+        }
+
+        /// <summary>Выполняет перемотку источника под той же блокировкой,
+        /// что и Read. Даже при ошибке перемотки старый кеш не используется.</summary>
+        public void Seek(Action seekSource)
+        {
+            ArgumentNullException.ThrowIfNull(seekSource);
             lock (_lock)
             {
-                _readBufferCount = 0;
-                _readBufferPos = 0;
-                _phase = 0;
-                _primed = false;
-                _sourceEnded = false;
+                try { seekSource(); }
+                finally { ResetCore(); }
             }
+        }
+
+        private void ResetCore()
+        {
+            _readBufferCount = 0;
+            _readBufferPos = 0;
+            _phase = 0;
+            _primed = false;
+            _sourceEnded = false;
+            _lastFrame = false;
+            _finished = false;
         }
 
         public int Read(float[] buffer, int offset, int count)
         {
+            ArgumentNullException.ThrowIfNull(buffer);
+            if (offset < 0 || count < 0 || offset > buffer.Length - count)
+                throw new ArgumentOutOfRangeException(nameof(count));
+
             lock (_lock)
             {
                 int frames = count / _channels;
+                if (frames == 0 || _finished) return 0;
                 int written = 0;
 
                 if (!_primed)
                 {
-                    if (!TryReadFrame(_frameA)) return 0;
+                    if (!TryReadFrame(_frameA))
+                    {
+                        _finished = true;
+                        return 0;
+                    }
                     if (!TryReadFrame(_frameB))
                     {
-                        // В источнике был ровно один кадр - отдаём его и заканчиваем
-                        Array.Copy(_frameA, 0, buffer, offset, _channels);
-                        return _channels;
+                        Array.Copy(_frameA, _frameB, _channels);
+                        _lastFrame = true;
                     }
                     _primed = true;
                     _phase = 0;
                 }
 
-                for (int i = 0; i < frames; i++)
+                for (int i = 0; i < frames && !_finished; i++)
                 {
                     for (int ch = 0; ch < _channels; ch++)
                     {
@@ -99,15 +126,22 @@ namespace PhotoMusicViewer.Services
                     _phase += _speed;
                     while (_phase >= 1.0)
                     {
+                        _phase -= 1.0;
+                        if (_lastFrame)
+                        {
+                            _finished = true;
+                            break;
+                        }
                         Array.Copy(_frameB, _frameA, _channels);
                         if (!TryReadFrame(_frameB))
                         {
-                            return written; // источник закончился - отдаём, что успели
+                            // Последний кадр имеет длительность одного входного кадра.
+                            // На медленной скорости выдаём его до конца, затем Read == 0.
+                            Array.Copy(_frameA, _frameB, _channels);
+                            _lastFrame = true;
                         }
-                        _phase -= 1.0;
                     }
                 }
-
                 return written;
             }
         }

@@ -37,9 +37,68 @@ namespace PhotoMusicViewer.Views
             Closed += (_, _) => { try { _cts?.Cancel(); } catch (Exception ex) { AppLog.Debug("TranslationSettingsWindow.Closed", ex); } };
         }
 
+        /// <summary>Страница проекта. Открывается только проверенный https-адрес — не файл и не скрипт.</summary>
+        private void GitHub_Click(object sender, RoutedEventArgs e)
+        {
+            if (!AppInfo.TryGetSafeLink(AppInfo.GitHubUrl, out var uri))
+            {
+                MessageBox.Show(this,
+                    Loc.T("The GitHub link is invalid. Only https addresses are opened.",
+                          "Неверная ссылка на GitHub. Открываются только адреса https.",
+                          "El enlace de GitHub no es válido. Solo se abren direcciones https."),
+                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = uri.AbsoluteUri, UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("TranslationSettingsWindow.OpenGitHub", ex);
+                MessageBox.Show(this,
+                    Loc.T("Couldn't open the browser: ", "Не удалось открыть браузер: ", "No se pudo abrir el navegador: ") + ex.Message,
+                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
         private void ApplyLocalization()
         {
-            Title = Loc.T("Translation settings", "Настройки перевода", "Ajustes de traducción");
+            Title = Loc.T("Settings", "Настройки", "Ajustes");
+
+            InterfaceHeader.Text = Loc.T("Interface", "Интерфейс", "Interfaz");
+            StartupLanguageLabel.Text = Loc.T("Language at startup", "Язык при запуске", "Idioma al iniciar");
+            SetComboItemText(StartupLanguageCombo, 0, Loc.T("As in Windows", "Как в Windows", "Como en Windows"));
+            RememberLanguageCheck.Content = Loc.T("Remember the language chosen with the EN / RU / ES button",
+                "Запоминать язык, выбранный кнопкой EN / RU / ES", "Recordar el idioma elegido con el botón EN / RU / ES");
+            PhotoSortLabel.Text = Loc.T("Photo sorting", "Сортировка фото", "Orden de fotos");
+            MusicSortLabel.Text = Loc.T("Playlist sorting", "Сортировка плейлиста", "Orden de la lista");
+            foreach (var combo in new[] { PhotoSortCombo, MusicSortCombo })
+            {
+                SetComboItemText(combo, 0, Loc.T("Name", "Имя", "Nombre"));
+                SetComboItemText(combo, 1, Loc.T("Date modified", "Дата изменения", "Fecha de modificación"));
+                SetComboItemText(combo, 2, Loc.T("Size", "Размер", "Tamaño"));
+                SetComboItemText(combo, 3, Loc.T("Type", "Тип", "Tipo"));
+            }
+            foreach (var combo in new[] { PhotoSortDirectionCombo, MusicSortDirectionCombo })
+            {
+                SetComboItemText(combo, 0, Loc.T("Ascending ↑", "По возрастанию ↑", "Ascendente ↑"));
+                SetComboItemText(combo, 1, Loc.T("Descending ↓", "По убыванию ↓", "Descendente ↓"));
+            }
+            RememberSortCheck.Content = Loc.T("Remember the sorting chosen on the toolbar",
+                "Запоминать сортировку, выбранную на панели", "Recordar el orden elegido en la barra");
+            VolumeLabel.Text = Loc.T("Volume at startup", "Громкость при запуске", "Volumen al iniciar");
+            RememberVolumeCheck.Content = Loc.T("Remember the last volume", "Запоминать последнюю громкость", "Recordar el último volumen");
+            ConfirmDeleteCheck.Content = Loc.T("Ask before moving a photo to the Recycle Bin",
+                "Спрашивать перед перемещением фото в корзину", "Preguntar antes de mover una foto a la papelera");
+            ConfirmDeleteHint.Text = Loc.T(
+                "If a file can't go to the Recycle Bin (USB stick, network drive, too large), Windows always asks before deleting it permanently — even with this option off.",
+                "Если файл не может попасть в корзину (флешка, сетевой диск, слишком большой), Windows всегда спросит перед безвозвратным удалением — даже при выключенной галочке.",
+                "Si un archivo no puede ir a la papelera (USB, red, demasiado grande), Windows siempre pregunta antes de borrarlo definitivamente, incluso sin esta opción.");
+            InterfaceHint.Text = Loc.T(
+                "Applied when you press OK. Photo sorting is used for every newly opened folder. With remembering on, changes on the toolbar replace these values. Stored in %LOCALAPPDATA%\\PhotoMusicViewer\\preferences.json — no file names or paths.",
+                "Применяется по кнопке OK. Сортировка фото действует для каждой новой открытой папки. С запоминанием изменения на панели заменяют эти значения. Хранится в %LOCALAPPDATA%\\PhotoMusicViewer\\preferences.json — без имён файлов и путей.",
+                "Se aplica al pulsar OK. El orden de fotos se usa en cada carpeta nueva. Con «recordar», los cambios en la barra sustituyen estos valores. Se guarda en %LOCALAPPDATA%\\PhotoMusicViewer\\preferences.json, sin nombres ni rutas.");
 
             KeysHeader.Text = Loc.T("API keys", "Ключи API", "Claves de API");
             DeepLKeyLabel.Text = Loc.T("DeepL API key", "Ключ DeepL", "Clave de DeepL");
@@ -65,13 +124,6 @@ namespace PhotoMusicViewer.Views
             LanguagesHeader.Text = Loc.T("Languages", "Языки", "Idiomas");
             TargetLangLabel.Text = Loc.T("Translate into", "Переводить на", "Traducir a");
             SourceLangLabel.Text = Loc.T("Source language", "Язык источника", "Idioma de origen");
-            StartupLangLabel.Text = Loc.T("Interface language at startup",
-                "Язык интерфейса при запуске", "Idioma de la interfaz al iniciar");
-            StartupLangSystemItem.Content = Loc.T("System language", "Язык системы", "Idioma del sistema");
-            StartupLangHint.Text = Loc.T(
-                "The app opens in this language. The EN/RU/ES button still switches it on the fly. Saved in a small file with this choice only (no keys).",
-                "Приложение запускается на этом языке. Кнопка EN/RU/ES по-прежнему переключает язык на лету. Выбор хранится в маленьком файле — только он, без ключей.",
-                "La aplicación se abre en este idioma. El botón EN/RU/ES sigue cambiándolo al instante. Se guarda en un archivo pequeño solo con esta opción (sin claves).");
 
             GoogleEngineLabel.Text = Loc.T("Service for text translation",
                 "Сервис для перевода текста", "Servicio para traducir texto");
@@ -95,6 +147,9 @@ namespace PhotoMusicViewer.Views
             QwenTemperatureLabel.Text = Loc.T("Temperature (0 = most literal)",
                 "Температура (0 = максимально точно)", "Temperatura (0 = más literal)");
             LoadQwenModelsButton.Content = Loc.T("Load list", "Загрузить список", "Cargar lista");
+            QwenLoopbackHttpCheck.Content = Loc.T("Allow unencrypted HTTP only for localhost / loopback",
+                "Разрешить незашифрованный HTTP только для localhost / loopback",
+                "Permitir HTTP sin cifrar solo para localhost / loopback");
             QwenBaseUrlLabel.Text = Loc.T("Own Base URL (workspace domain)",
                 "Свой адрес API (домен рабочего пространства)", "URL propia (dominio del espacio)");
             QwenBaseUrlHint.Text = Loc.T(
@@ -146,25 +201,51 @@ namespace PhotoMusicViewer.Views
                 "Пересжимать фото перед отправкой (убирает EXIF/GPS, уходят только пиксели)",
                 "Recodificar la foto antes de enviarla (elimina EXIF/GPS)");
             AskNetworkCheck.Content = Loc.T(
-                "Ask for confirmation before the first network request in a session",
-                "Спрашивать подтверждение перед первым сетевым запросом в сессии",
-                "Pedir confirmación antes de la primera solicitud de red");
+                "Ask for confirmation before sending — separately for text and for photos",
+                "Спрашивать подтверждение перед отправкой — отдельно для текста и для фотографий",
+                "Pedir confirmación antes de enviar: por separado para texto y para fotos");
             PersistCheck.Content = Loc.T(
-                "Save these settings and keys to a file in plain text",
-                "Сохранять эти настройки и ключи в файл открытым текстом",
-                "Guardar estos ajustes y claves en un archivo en texto plano");
+                "Remember settings and keys on this computer (keys are encrypted with Windows DPAPI)",
+                "Запоминать настройки и ключи на этом компьютере (ключи шифруются средствами Windows, DPAPI)",
+                "Recordar ajustes y claves en este equipo (las claves se cifran con DPAPI de Windows)");
             DeleteFileButton.Content = Loc.T("Delete settings file", "Удалить файл настроек", "Eliminar el archivo");
 
             LogCheck.Content = Loc.T(
                 "Keep a diagnostic log (error types only, no file names or text)",
                 "Вести журнал диагностики (только типы ошибок, без имён файлов и текстов)",
                 "Registro de diagnóstico (solo tipos de error, sin nombres ni textos)");
+            TracesHeader.Text = Loc.T("Traces in Windows", "Следы в Windows", "Rastros en Windows");
+            CleanRecentCheck.Content = Loc.T(
+                "Remove opened files from Recent items (shortcuts in the Recent folder and this app's jump list)",
+                "Убирать открытые файлы из «Недавних» (ярлыки в папке Recent и список переходов приложения)",
+                "Quitar los archivos abiertos de Recientes (accesos directos y lista de saltos de la aplicación)");
+            CleanRegistryCheck.Content = Loc.T(
+                "Remove opened files from Explorer history in the registry (RecentDocs, open/save dialog history)",
+                "Убирать открытые файлы из истории Проводника в реестре (RecentDocs, история диалогов открытия)",
+                "Quitar los archivos abiertos del historial del Explorador en el registro (RecentDocs, diálogos)");
+            TracesHint.Text = Loc.T(
+                "Off by default. Applies immediately to files opened with a double click, drag and drop or the Open dialog. These options change Windows data that other programs also use.",
+                "По умолчанию выключено. Действует сразу — для файлов, открытых двойным кликом, перетаскиванием или через диалог открытия. Эти функции изменяют данные Windows, которыми пользуются и другие программы.",
+                "Desactivado por defecto. Se aplica de inmediato. Estas opciones modifican datos de Windows que usan otros programas.");
+            ThumbCacheCheck.Content = Loc.T(
+                "Keep thumbnails on disk (the thumbnail grid opens faster)",
+                "Хранить миниатюры на диске (сетка миниатюр открывается быстрее)",
+                "Guardar miniaturas en el disco (la cuadrícula se abre más rápido)");
+            ClearThumbCacheButton.Content = Loc.T("Clear thumbnail cache", "Очистить кэш миниатюр", "Borrar caché de miniaturas");
             OpenLogFolderButton.Content = Loc.T("Open log folder", "Открыть папку журнала", "Abrir la carpeta del registro");
             DeleteLogButton.Content = Loc.T("Delete log", "Удалить журнал", "Eliminar el registro");
             PrivacyNotice.Text = Loc.T(
-                "Everything else in this app stays offline. Text or photos leave your computer only when you press a translate button, and only to the service you pressed.",
-                "Всё остальное в приложении остаётся оффлайн. Текст или фото покидают компьютер только по нажатию кнопки перевода и только в тот сервис, который вы нажали.",
-                "Todo lo demás permanece sin conexión. El texto o las fotos salen solo al pulsar un botón de traducción.");
+                "Everything else in this app stays offline. Text or photos leave your computer only when you press a translate button, and only to the service you pressed. Text and photos are two separate permissions: allowing one does not allow the other.",
+                "Всё остальное в приложении остаётся оффлайн. Текст или фото покидают компьютер только по нажатию кнопки перевода и только в тот сервис, который вы нажали. Текст и фотографии — два отдельных разрешения: согласие на одно не даёт согласия на другое.",
+                "Todo lo demás permanece sin conexión. El texto o las fotos salen solo al pulsar un botón de traducción. Texto y fotos son dos permisos independientes.");
+
+            AboutHeader.Text = Loc.T("About", "О программе", "Acerca de");
+            VersionText.Text = "PhotoMusicViewer — " + Loc.T("version ", "версия ", "versión ") + AppInfo.Version;
+            GitHubButton.Content = Loc.T("Open project page on GitHub", "Открыть страницу проекта на GitHub", "Abrir la página del proyecto en GitHub");
+            GitHubHint.Text = AppInfo.GitHubUrl + "\n" + Loc.T(
+                "Opens in your default browser. Nothing is sent until you press the button.",
+                "Откроется в браузере по умолчанию. Пока кнопка не нажата, никуда ничего не отправляется.",
+                "Se abre en el navegador predeterminado. No se envía nada hasta pulsar el botón.");
 
             TestButton.Content = Loc.T("Test keys", "Проверить ключи", "Probar claves");
             OkButton.Content = Loc.T("OK", "ОК", "OK");
@@ -182,8 +263,70 @@ namespace PhotoMusicViewer.Views
             foreach (var lang in TranslationLanguages.All) SourceLangCombo.Items.Add(lang);
         }
 
+        /// <summary>Настройки интерфейса — копия; применяются только по OK.</summary>
+        private void FillPreferences()
+        {
+            var prefs = AppPreferences.Current;
+            StartupLanguageCombo.SelectedIndex = (int)prefs.Language;
+            RememberLanguageCheck.IsChecked = prefs.RememberLanguage;
+            PhotoSortCombo.SelectedIndex = (int)prefs.PhotoSort;
+            PhotoSortDirectionCombo.SelectedIndex = prefs.PhotoSortDescending ? 1 : 0;
+            MusicSortCombo.SelectedIndex = (int)prefs.MusicSort;
+            MusicSortDirectionCombo.SelectedIndex = prefs.MusicSortDescending ? 1 : 0;
+            RememberSortCheck.IsChecked = prefs.RememberSort;
+            StartupVolumeSlider.Value = Math.Round(prefs.Volume * 100);
+            RememberVolumeCheck.IsChecked = prefs.RememberVolume;
+            ConfirmDeleteCheck.IsChecked = prefs.ConfirmDelete;
+            UpdateStartupVolumeText();
+        }
+
+        private PreferenceValues BuildPreferencesFromUi()
+        {
+            var prefs = AppPreferences.Current;
+            prefs.Language = (StartupLanguage)Math.Max(0, StartupLanguageCombo.SelectedIndex);
+            prefs.RememberLanguage = RememberLanguageCheck.IsChecked == true;
+            prefs.PhotoSort = (FileSortKey)Math.Max(0, PhotoSortCombo.SelectedIndex);
+            prefs.PhotoSortDescending = PhotoSortDirectionCombo.SelectedIndex == 1;
+            prefs.MusicSort = (FileSortKey)Math.Max(0, MusicSortCombo.SelectedIndex);
+            prefs.MusicSortDescending = MusicSortDirectionCombo.SelectedIndex == 1;
+            prefs.RememberSort = RememberSortCheck.IsChecked == true;
+            prefs.Volume = StartupVolumeSlider.Value / 100.0;
+            prefs.RememberVolume = RememberVolumeCheck.IsChecked == true;
+            prefs.ConfirmDelete = ConfirmDeleteCheck.IsChecked == true;
+            prefs.EnsureValid();
+            return prefs;
+        }
+
+        private void StartupVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateStartupVolumeText();
+
+        private void UpdateStartupVolumeText()
+        {
+            if (StartupVolumeText != null && StartupVolumeSlider != null)
+                StartupVolumeText.Text = $"{(int)Math.Round(StartupVolumeSlider.Value)}%";
+        }
+
+        private static void SetComboItemText(ComboBox combo, int index, string text)
+        {
+            if (index < combo.Items.Count && combo.Items[index] is ComboBoxItem item) item.Content = text;
+        }
+
+        /// <summary>
+        /// Сначала язык (его смена запоминается как «последний выбранный»), затем сами
+        /// значения — чтобы выбор «Как в Windows» не перезаписался конкретным языком.
+        /// </summary>
+        private void ApplyPreferences()
+        {
+            var prefs = BuildPreferencesFromUi();
+            var before = AppPreferences.Current;
+            if (prefs.Language != before.Language)
+                Loc.SetLanguage(Loc.ResolveStartup(prefs.Language));
+            if (!AppPreferences.Save(prefs))
+                AppLog.Warn("TranslationSettingsWindow.SavePreferences", null, "interface preferences were applied for this session only");
+        }
+
         private void FillFromDraft()
         {
+            FillPreferences();
             _loading = true;
             try
             {
@@ -196,7 +339,6 @@ namespace PhotoMusicViewer.Views
 
                 SelectLanguage(TargetLangCombo, _draft.TargetLanguage);
                 SelectLanguage(SourceLangCombo, _draft.SourceLanguage);
-                SelectByTag(StartupLangCombo, AppSettings.Startup.ToString());
 
                 SelectByTag(GoogleEngineCombo, _draft.GoogleEngine.ToString());
 
@@ -212,6 +354,7 @@ namespace PhotoMusicViewer.Views
 
                 SelectByTag(QwenRegionCombo, _draft.QwenRegion.ToString());
                 QwenBaseUrlBox.Text = _draft.QwenBaseUrl;
+                QwenLoopbackHttpCheck.IsChecked = _draft.QwenAllowLoopbackHttp;
 
                 foreach (var model in TranslationService.QwenTextModels) QwenModelCombo.Items.Add(model);
                 QwenModelCombo.Text = _draft.QwenModel;
@@ -243,12 +386,54 @@ namespace PhotoMusicViewer.Views
                 AskNetworkCheck.IsChecked = _draft.AskBeforeNetwork;
                 PersistCheck.IsChecked = _draft.PersistToDisk;
                 LogCheck.IsChecked = AppLog.Enabled;
+                CleanRecentCheck.IsChecked = TraceCleanupOptions.RecentItems;
+                CleanRegistryCheck.IsChecked = TraceCleanupOptions.ExplorerRegistry;
+                ThumbCacheCheck.IsChecked = ThumbnailDiskCache.Enabled;
             }
             finally { _loading = false; }
 
             UpdateEngineDependentControls();
             UpdatePersistInfo();
             UpdateLogInfo();
+            UpdateThumbCacheInfo();
+        }
+
+        private void UpdateThumbCacheInfo()
+        {
+            long bytes = ThumbnailDiskCache.SizeOnDisk();
+            string size = (bytes / (1024.0 * 1024.0)).ToString("0.0", CultureInfo.CurrentCulture);
+            ThumbCacheText.Text = ThumbnailDiskCache.Enabled
+                ? string.Format(Loc.T(
+                    "Folder: {0}. Now {1} MB of {2} MB. File names are salted hashes, not paths; off by default because it leaves a trace of viewed photos.",
+                    "Папка: {0}. Сейчас {1} МБ из {2} МБ. Имена файлов — хэши с солью, а не пути. По умолчанию выключено: это след просмотренных фото на диске.",
+                    "Carpeta: {0}. Ahora {1} MB de {2} MB. Desactivado por defecto: deja rastro de las fotos vistas."),
+                    ThumbnailDiskCache.CacheDirectory, size, ThumbnailDiskCache.MaxBytes / (1024 * 1024))
+                : Loc.T("Off: thumbnails are kept only in memory while the app is open. Turning it off deletes the cache.",
+                        "Выключено: миниатюры живут только в памяти, пока приложение открыто. Выключение удаляет кэш.",
+                        "Desactivado: las miniaturas solo se guardan en memoria. Al desactivarlo se borra la caché.");
+            ClearThumbCacheButton.IsEnabled = bytes > 0;
+        }
+
+        private void ThumbCacheCheck_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            // Применяется сразу, как журнал; выключение удаляет все записи
+            bool saved = ThumbnailDiskCache.SetEnabled(ThumbCacheCheck.IsChecked == true);
+            UpdateThumbCacheInfo();
+            SetStatus(!saved
+                ? Loc.T("Could not save the setting.", "Не удалось сохранить настройку.", "No se pudo guardar el ajuste.")
+                : ThumbnailDiskCache.Enabled
+                    ? Loc.T("Thumbnail disk cache is on.", "Кэш миниатюр на диске включён.", "Caché de miniaturas activada.")
+                    : Loc.T("Thumbnail disk cache is off and deleted.", "Кэш миниатюр на диске выключен и удалён.", "Caché de miniaturas desactivada y borrada."));
+        }
+
+        private void ClearThumbCache_Click(object sender, RoutedEventArgs e)
+        {
+            bool cleared = ThumbnailDiskCache.Clear();
+            UpdateThumbCacheInfo();
+            SetStatus(cleared
+                ? Loc.T("Thumbnail cache deleted.", "Кэш миниатюр удалён.", "Caché de miniaturas borrada.")
+                : Loc.T("Could not delete the thumbnail cache.", "Не удалось удалить кэш миниатюр.", "No se pudo borrar la caché."));
         }
 
         private static void SelectLanguage(ComboBox combo, string? code)
@@ -314,7 +499,11 @@ namespace PhotoMusicViewer.Views
         private void UpdatePersistInfo()
         {
             PersistPathText.Text = PersistCheck.IsChecked == true
-                ? string.Format(Loc.T("File: {0}", "Файл: {0}", "Archivo: {0}"), TranslationConfig.SettingsFilePath)
+                ? string.Format(
+                    Loc.T("File: {0} — keys are encrypted for your Windows account, so the file is useless under another account or on another computer.",
+                          "Файл: {0} — ключи зашифрованы под вашу учётную запись Windows: под другой учётной записью или на другом компьютере файл бесполезен.",
+                          "Archivo: {0}: las claves se cifran para su cuenta de Windows, así que el archivo es inútil en otra cuenta u otro equipo."),
+                    TranslationConfig.SettingsFilePath)
                 : Loc.T("Keys stay in memory only and disappear when the app closes.",
                         "Ключи хранятся только в памяти и исчезают при закрытии приложения.",
                         "Las claves solo se guardan en memoria y desaparecen al cerrar la aplicación.");
@@ -454,6 +643,21 @@ namespace PhotoMusicViewer.Views
             PromptList.SelectedIndex = 0;
         }
 
+        private string _networkDestination = "";
+        private bool EnsureProbeConsent(Func<System.Collections.Generic.IEnumerable<string>> endpoints)
+        {
+            _networkDestination = "";
+            try
+            {
+                var recipients = System.Linq.Enumerable.ToArray(endpoints());
+                _networkDestination = string.Join(", ", System.Linq.Enumerable.Distinct(System.Linq.Enumerable.Select(recipients, NetworkEndpointPolicy.Origin)));
+                bool allowed = NetworkConsentDialog.Ensure(this, NetworkDataKind.ServiceProbe, recipients);
+                if (!allowed) SetStatus(NetworkConsentDialog.Declined);
+                return allowed;
+            }
+            catch (TranslationException ex) { SetStatus(ex.Message); return false; }
+        }
+
         private async void LoadModelsButton_Click(object sender, RoutedEventArgs e)
         {
             var probe = BuildSettingsFromUi();
@@ -465,8 +669,14 @@ namespace PhotoMusicViewer.Views
                 return;
             }
 
+            // Список моделей — тоже сетевой запрос, раньше он уходил вообще без спроса
+            if (!EnsureProbeConsent(() => new[] { "https://generativelanguage.googleapis.com" }))
+            {
+                return;
+            }
+
             LoadModelsButton.IsEnabled = false;
-            SetStatus(Loc.T("Loading models…", "Загружаю список моделей…", "Cargando modelos…"));
+            SetStatus(Loc.T("Loading models…", "Загружаю список моделей…", "Cargando modelos…") + " → " + _networkDestination);
 
             _cts?.Cancel();
             _cts = new CancellationTokenSource();
@@ -510,8 +720,14 @@ namespace PhotoMusicViewer.Views
                 return;
             }
 
+            // Список моделей — тоже сетевой запрос, как и у Gemini
+            if (!EnsureProbeConsent(() => new[] { TranslationService.GetEndpoint(TranslationProvider.Qwen, NetworkDataKind.ServiceProbe, probe) }))
+            {
+                return;
+            }
+
             LoadQwenModelsButton.IsEnabled = false;
-            SetStatus(Loc.T("Loading models…", "Загружаю список моделей…", "Cargando modelos…"));
+            SetStatus(Loc.T("Loading models…", "Загружаю список моделей…", "Cargando modelos…") + " → " + _networkDestination);
 
             _cts?.Cancel();
             _cts = new CancellationTokenSource();
@@ -557,8 +773,14 @@ namespace PhotoMusicViewer.Views
         {
             var probe = BuildSettingsFromUi();
 
+            // Проверка ключа — сетевой запрос, хоть ни текст, ни фото в нём не участвуют
+            if (!EnsureProbeConsent(() => TranslationService.GetProbeEndpoints(probe)))
+            {
+                return;
+            }
+
             TestButton.IsEnabled = false;
-            SetStatus(Loc.T("Checking…", "Проверяю…", "Comprobando…"));
+            SetStatus(Loc.T("Checking…", "Проверяю…", "Comprobando…") + " → " + _networkDestination);
 
             _cts?.Cancel();
             _cts = new CancellationTokenSource();
@@ -603,11 +825,17 @@ namespace PhotoMusicViewer.Views
 
         private void DeleteFile_Click(object sender, RoutedEventArgs e)
         {
-            TranslationConfig.DeleteFile();
+            try { TranslationConfig.DeleteFile(); }
+            catch (Exception ex)
+            {
+                AppLog.Warn("TranslationSettingsWindow.DeleteSettings", ex);
+                PersistCheck.IsChecked = false; _draft.PersistToDisk = false;
+                UpdatePersistInfo(); SetStatus(ex.Message); return;
+            }
             PersistCheck.IsChecked = false;
             _draft.PersistToDisk = false;
             UpdatePersistInfo();
-            SetStatus(Loc.T("Settings file deleted.", "Файл настроек удалён.", "Archivo de ajustes eliminado."));
+            SetStatus(Loc.T("Settings and their backup files deleted.", "Настройки и их резервные файлы удалены.", "Archivo de ajustes eliminado."));
         }
 
         private void LogCheck_Changed(object sender, RoutedEventArgs e)
@@ -621,6 +849,28 @@ namespace PhotoMusicViewer.Views
             SetStatus(AppLog.Enabled
                 ? Loc.T("Diagnostic log is on.", "Журнал диагностики включён.", "Registro de diagnóstico activado.")
                 : Loc.T("Diagnostic log is off.", "Журнал диагностики выключен.", "Registro de diagnóstico desactivado."));
+        }
+
+        private void TraceCleanupCheck_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+
+            // Как и журнал, это не часть настроек перевода: применяется сразу, не по OK,
+            // и помнится файлом-меткой, чтобы работать уже при запуске двойным кликом.
+            bool on = ((System.Windows.Controls.CheckBox)sender).IsChecked == true;
+            bool saved = ReferenceEquals(sender, CleanRegistryCheck)
+                ? TraceCleanupOptions.SetExplorerRegistry(on)
+                : TraceCleanupOptions.SetRecentItems(on);
+
+            string what = ReferenceEquals(sender, CleanRegistryCheck)
+                ? Loc.T("Explorer registry history cleanup", "Очистка истории Проводника в реестре", "Limpieza del registro del Explorador")
+                : Loc.T("Recent items cleanup", "Очистка «Недавних»", "Limpieza de Recientes");
+            string state = on ? Loc.T("on", "включена", "activada") : Loc.T("off", "выключена", "desactivada");
+            SetStatus(saved
+                ? what + ": " + state + "."
+                : what + ": " + state + " " + Loc.T("until the app is closed (could not save the setting).",
+                    "до закрытия приложения (не удалось сохранить настройку).",
+                    "hasta cerrar la aplicación (no se pudo guardar)."));
         }
 
         private void OpenLogFolder_Click(object sender, RoutedEventArgs e)
@@ -686,7 +936,11 @@ namespace PhotoMusicViewer.Views
             settings.GeminiTemperature = temperature;
             settings.QwenTemperature = qwenTemperature;
             settings.EnsureValid();
-
+            if (settings.QwenRegion == QwenRegionMode.Custom)
+            {
+                try { _ = TranslationService.GetEndpoint(TranslationProvider.Qwen, NetworkDataKind.Text, settings); }
+                catch (TranslationException ex) { SetStatus(ex.Message); QwenBaseUrlBox.Focus(); return; }
+            }
             TranslationConfig.Current = settings;
 
             try
@@ -703,31 +957,8 @@ namespace PhotoMusicViewer.Views
                     Title, MessageBoxButton.OK, MessageBoxImage.Warning);
             }
 
-            ApplyStartupLanguageChoice();
-
+            ApplyPreferences();
             DialogResult = true;
-        }
-
-        /// <summary>
-        /// Запоминает язык запуска и, если выбор изменился, сразу включает его.
-        /// Хранится отдельно от ключей (AppSettings), поэтому не зависит от галочки сохранения ключей.
-        /// </summary>
-        private void ApplyStartupLanguageChoice()
-        {
-            var tag = TagOf(StartupLangCombo, AppSettings.Startup.ToString());
-            if (!Enum.TryParse<StartupLanguage>(tag, out var chosen)) return;
-            if (chosen == AppSettings.Startup) return;
-
-            if (!AppSettings.SaveStartupLanguage(chosen))
-            {
-                MessageBox.Show(this,
-                    Loc.T("The startup language is applied, but the settings file could not be written. It will be forgotten when the app closes.",
-                          "Язык применён, но файл настроек записать не удалось. После закрытия приложения выбор будет забыт.",
-                          "El idioma se aplicó, pero no se pudo escribir el archivo. Se olvidará al cerrar la aplicación."),
-                    Title, MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-
-            Loc.SetLanguage(AppSettings.Resolve(chosen));
         }
 
         /// <summary>Собирает настройки из полей формы (используется и для проверки ключей до OK).</summary>
@@ -761,6 +992,7 @@ namespace PhotoMusicViewer.Views
             };
 
             settings.QwenBaseUrl = QwenBaseUrlBox.Text.Trim();
+            settings.QwenAllowLoopbackHttp = QwenLoopbackHttpCheck.IsChecked == true;
 
             var qwenModel = (QwenModelCombo.Text ?? "").Trim();
             if (qwenModel.Length > 0) settings.QwenModel = qwenModel;

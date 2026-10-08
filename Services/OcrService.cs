@@ -44,7 +44,7 @@ namespace PhotoMusicViewer.Services
 
                 // SoftwareBitmap - объект WinRT, а не DispatcherObject: его можно
                 // создать в фоне и использовать в UI-потоке без Freeze
-                var bitmap = LoadAsSoftwareBitmap(imagePath, (int)OcrEngine.MaxImageDimension);
+                var bitmap = LoadAsSoftwareBitmap(imagePath, (int)OcrEngine.MaxImageDimension, cancellationToken);
                 return (created, bitmap);
             }, cancellationToken);
 
@@ -110,18 +110,11 @@ namespace PhotoMusicViewer.Services
             return engines;
         }
 
-        private static SoftwareBitmap LoadAsSoftwareBitmap(string path, int maxDimension)
+        private static SoftwareBitmap LoadAsSoftwareBitmap(string path, int maxDimension, CancellationToken token)
         {
             // Декодируем через WPF - он понимает те же форматы, что приложение умеет показывать,
             // и не имеет проблем с русскими буквами в пути к файлу.
-            BitmapSource source;
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            {
-                var decoder = System.Windows.Media.Imaging.BitmapDecoder.Create(
-                    stream, BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile,
-                    BitmapCacheOption.OnLoad);
-                source = decoder.Frames[0];
-            }
+            BitmapSource source = SafeImageDecoder.LoadDecoded(path, maxDimension, token: token).Image;
 
             // OCR-движок Windows не принимает слишком большие изображения - уменьшаем при необходимости
             int maxSide = Math.Max(source.PixelWidth, source.PixelHeight);
@@ -138,11 +131,13 @@ namespace PhotoMusicViewer.Services
                 source = new TransformedBitmap(source, new ScaleTransform(scale, scale));
             }
 
+            token.ThrowIfCancellationRequested();
             var converted = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
             int width = converted.PixelWidth;
             int height = converted.PixelHeight;
-            int stride = width * 4;
-            var pixels = new byte[stride * height];
+            ImageSafetyPolicy.ValidateWorkingSet(width, height, 32);
+            int stride = checked(width * 4);
+            var pixels = new byte[checked(stride * height)];
             converted.CopyPixels(pixels, stride, 0);
 
             return SoftwareBitmap.CreateCopyFromBuffer(

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -38,15 +39,48 @@ namespace PhotoMusicViewer.Services
 
     /// <summary>
     /// Все настройки перевода. По умолчанию живут только в памяти процесса —
-    /// как и остальные настройки этого приложения. На диск попадают лишь
-    /// при явно включённой галочке PersistToDisk (открытым текстом, включая ключи).
+    /// как и остальные настройки этого приложения. На диск попадают лишь при явно
+    /// включённой галочке PersistToDisk, причём ключи API шифруются DPAPI под
+    /// текущую учётную запись Windows — см. SecretProtector.
     /// </summary>
     public sealed class TranslationSettings
     {
         // --- Ключи API (вводит пользователь) ---
-        public string DeepLKey { get; set; } = "";
-        public string GoogleKey { get; set; } = "";
-        public string QwenKey { get; set; } = "";
+        // В JSON эти три свойства не попадают никогда: на диск уходят только
+        // зашифрованные варианты ниже.
+        [JsonIgnore] public string DeepLKey { get; set; } = "";
+        [JsonIgnore] public string GoogleKey { get; set; } = "";
+        [JsonIgnore] public string QwenKey { get; set; } = "";
+
+        /// <summary>Ключ DeepL, зашифрованный DPAPI. Заполняется только на время записи/чтения файла.</summary>
+        [JsonPropertyName("DeepLKeyProtected")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? DeepLKeyProtected { get; set; }
+
+        /// <summary>Ключ Google, зашифрованный DPAPI.</summary>
+        [JsonPropertyName("GoogleKeyProtected")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? GoogleKeyProtected { get; set; }
+
+        /// <summary>Ключ Qwen, зашифрованный DPAPI.</summary>
+        [JsonPropertyName("QwenKeyProtected")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? QwenKeyProtected { get; set; }
+
+        // Ключи из файлов старых версий — там они лежали открытым текстом.
+        // Читаются один раз при миграции и больше никогда не записываются
+        // (сразу после чтения обнуляются, а null не сериализуется).
+        [JsonPropertyName("DeepLKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LegacyDeepLKey { get; set; }
+
+        [JsonPropertyName("GoogleKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LegacyGoogleKey { get; set; }
+
+        [JsonPropertyName("QwenKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LegacyQwenKey { get; set; }
 
         // --- Языки ---
         /// <summary>Код языка перевода в нотации DeepL (RU, EN-US, PT-BR, ...).</summary>
@@ -78,6 +112,7 @@ namespace PhotoMusicViewer.Services
         /// Учитывается, когда в списке регионов выбран пункт «Свой адрес».
         /// </summary>
         public string QwenBaseUrl { get; set; } = "";
+        public bool QwenAllowLoopbackHttp { get; set; } = false;
 
         /// <summary>Модель для перевода текста.</summary>
         public string QwenModel { get; set; } = "qwen-plus";
@@ -399,8 +434,70 @@ namespace PhotoMusicViewer.Services
         public TranslationSettings Clone()
         {
             var json = JsonSerializer.Serialize(this, TranslationConfig.JsonOptions);
-            return JsonSerializer.Deserialize<TranslationSettings>(json, TranslationConfig.JsonOptions)
-                   ?? CreateDefault();
+            var copy = JsonSerializer.Deserialize<TranslationSettings>(json, TranslationConfig.JsonOptions)
+                       ?? CreateDefault();
+
+            // Ключи помечены JsonIgnore и через JSON не проходят — переносим вручную
+            copy.DeepLKey = DeepLKey;
+            copy.GoogleKey = GoogleKey;
+            copy.QwenKey = QwenKey;
+            copy.DeepLKeyProtected = null;
+            copy.GoogleKeyProtected = null;
+            copy.QwenKeyProtected = null;
+            copy.LegacyDeepLKey = null;
+            copy.LegacyGoogleKey = null;
+            copy.LegacyQwenKey = null;
+            return copy;
+        }
+
+        /// <summary>Готовит объект к записи: ключи шифруются, открытые копии не сериализуются.</summary>
+        internal void ProtectKeysForDisk()
+        {
+            DeepLKeyProtected = SecretProtector.Protect(DeepLKey);
+            GoogleKeyProtected = SecretProtector.Protect(GoogleKey);
+            QwenKeyProtected = SecretProtector.Protect(QwenKey);
+            LegacyDeepLKey = null;
+            LegacyGoogleKey = null;
+            LegacyQwenKey = null;
+        }
+
+        /// <summary>
+        /// Восстанавливает ключи после чтения файла. Если файл от старой версии
+        /// и ключи в нём открытым текстом — выставляет migratedFromPlainText,
+        /// чтобы вызывающий код тут же перезаписал файл зашифрованным.
+        /// </summary>
+        internal void UnprotectKeysFromDisk(out bool migratedFromPlainText)
+        {
+            migratedFromPlainText = false;
+
+            DeepLKey = SecretProtector.Unprotect(DeepLKeyProtected) ?? "";
+            GoogleKey = SecretProtector.Unprotect(GoogleKeyProtected) ?? "";
+            QwenKey = SecretProtector.Unprotect(QwenKeyProtected) ?? "";
+
+            if (DeepLKey.Length == 0 && !string.IsNullOrWhiteSpace(LegacyDeepLKey))
+            {
+                DeepLKey = LegacyDeepLKey.Trim();
+                migratedFromPlainText = true;
+            }
+
+            if (GoogleKey.Length == 0 && !string.IsNullOrWhiteSpace(LegacyGoogleKey))
+            {
+                GoogleKey = LegacyGoogleKey.Trim();
+                migratedFromPlainText = true;
+            }
+
+            if (QwenKey.Length == 0 && !string.IsNullOrWhiteSpace(LegacyQwenKey))
+            {
+                QwenKey = LegacyQwenKey.Trim();
+                migratedFromPlainText = true;
+            }
+
+            DeepLKeyProtected = null;
+            GoogleKeyProtected = null;
+            QwenKeyProtected = null;
+            LegacyDeepLKey = null;
+            LegacyGoogleKey = null;
+            LegacyQwenKey = null;
         }
 
         /// <summary>Дозаполняет пустые списки/строки, чтобы интерфейс никогда не остался без промтов.</summary>
@@ -436,6 +533,7 @@ namespace PhotoMusicViewer.Services
             Converters = { new JsonStringEnumConverter() }
         };
 
+        private static readonly object SettingsDiskGate = new();
         private static TranslationSettings _current = TranslationSettings.CreateDefault();
 
         static TranslationConfig()
@@ -449,17 +547,23 @@ namespace PhotoMusicViewer.Services
             get => _current;
             set
             {
+                var previous = _current;
+
                 _current = value ?? TranslationSettings.CreateDefault();
                 _current.EnsureValid();
+
+                // Пользователь снова включил подтверждение — согласия, выданные пока
+                // оно было выключено, не должны молча продолжать действовать
+                if ((_current.AskBeforeNetwork && previous is { AskBeforeNetwork: false }) ||
+                    (previous.QwenAllowLoopbackHttp && !_current.QwenAllowLoopbackHttp))
+                    NetworkConsent.RevokeAll();
+
                 Changed?.Invoke();
             }
         }
 
         /// <summary>Срабатывает после применения новых настроек.</summary>
         public static event Action? Changed;
-
-        /// <summary>Пользователь подтвердил сетевые запросы в этой сессии.</summary>
-        public static bool NetworkAllowedForSession { get; set; }
 
         /// <summary>
         /// Переводит на новый язык интерфейса те промты, которые пользователь не менял:
@@ -514,24 +618,22 @@ namespace PhotoMusicViewer.Services
             Changed?.Invoke();
         }
 
-        private static string PrimaryPath =>
-            Path.Combine(AppContext.BaseDirectory, FileName);
+        /// <summary>
+        /// Единственное место хранения — профиль пользователя.
+        ///
+        /// Папка рядом с exe (AppContext.BaseDirectory) больше не используется: она одна
+        /// на всех пользователей машины, часто лежит в синхронизируемой папке и уезжает
+        /// целиком в архив вместе с приложением. Файл, оставшийся там от старых
+        /// версий, переносится сюда и удаляется — см. MigrateLegacyFile.
+        /// </summary>
+        public static string SettingsFilePath => Path.Combine(SettingsDirectory, FileName);
 
-        private static string FallbackPath =>
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PhotoMusicViewer", FileName);
+        private static string SettingsDirectory => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PhotoMusicViewer");
 
-        /// <summary>Путь к файлу настроек: существующий, иначе — предполагаемый (рядом с exe).</summary>
-        public static string SettingsFilePath
-        {
-            get
-            {
-                try { if (File.Exists(PrimaryPath)) return PrimaryPath; } catch (Exception ex) { AppLog.Debug("TranslationConfig.PrimaryPath", ex); }
-                try { if (File.Exists(FallbackPath)) return FallbackPath; } catch (Exception ex) { AppLog.Debug("TranslationConfig.FallbackPath", ex); }
-                return PrimaryPath;
-            }
-        }
+        /// <summary>Где файл лежал раньше. Нужен только для миграции и удаления.</summary>
+        private static string LegacyFilePath => Path.Combine(AppContext.BaseDirectory, FileName);
 
         public static bool SettingsFileExists
         {
@@ -543,6 +645,8 @@ namespace PhotoMusicViewer.Services
         {
             try
             {
+                MigrateLegacyFile();
+
                 var path = SettingsFilePath;
                 if (!File.Exists(path)) return;
 
@@ -550,9 +654,27 @@ namespace PhotoMusicViewer.Services
                     File.ReadAllText(path), JsonOptions);
                 if (loaded == null) return;
 
-                loaded.PersistToDisk = true; // файл есть — значит сохранение было включено
+                loaded.UnprotectKeysFromDisk(out bool migratedFromPlainText);
                 loaded.EnsureValid();
                 _current = loaded;
+
+                // Раньше здесь стояло PersistToDisk = true: сам факт наличия файла
+                // включал сохранение, даже если внутри было записано обратное. Теперь
+                // решает записанное значение, а противоречащий ему файл убирается.
+                if (!loaded.PersistToDisk)
+                {
+                    AppLog.Info("TranslationConfig.LoadFromDisk", null,
+                        "файл настроек при выключенном сохранении — удаляю");
+                    DeleteFile();
+                    return;
+                }
+
+                // Файл от старой версии с открытыми ключами — перезаписываем зашифрованным
+                if (migratedFromPlainText)
+                {
+                    try { SaveOrDelete(); }
+                    catch (Exception ex) { AppLog.Warn("TranslationConfig.ReencryptKeys", ex); }
+                }
             }
             catch (Exception ex)
             {
@@ -568,39 +690,97 @@ namespace PhotoMusicViewer.Services
         /// </summary>
         public static string? SaveOrDelete()
         {
+            lock (SettingsDiskGate) return SaveOrDeleteCore();
+        }
+        private static string? SaveOrDeleteCore()
+        {
             if (!Current.PersistToDisk)
             {
                 DeleteFile();
                 return null;
             }
 
-            var json = JsonSerializer.Serialize(Current, JsonOptions);
+            // Шифруем ключи в копии: у объекта в памяти они должны остаться открытыми
+            var forDisk = Current.Clone();
+            forDisk.ProtectKeysForDisk();
 
-            foreach (var path in new[] { PrimaryPath, FallbackPath })
-            {
-                try
-                {
-                    var dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    File.WriteAllText(path, json);
-                    return path;
-                }
-                catch (Exception ex)
-                {
-                    // папка только для чтения (например, Program Files) — пробуем следующий путь
-                    AppLog.Debug("TranslationConfig.SaveOrDelete путь недоступен", ex);
-                }
-            }
+            var json = JsonSerializer.Serialize(forDisk, JsonOptions);
+            var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(json);
 
-            throw new IOException("Could not write settings file.");
+            var path = SettingsFilePath;
+            Directory.CreateDirectory(SettingsDirectory);
+
+            // Та же атомарная запись, что и для фотографий: временный файл рядом,
+            // сброс на диск, замена одной операцией. Оборванная запись больше не оставляет
+            // пустой или наполовину записанный файл настроек.
+            SafeFileReplace.WriteThenReplace(path, stream => stream.Write(bytes, 0, bytes.Length));
+
+            return path;
         }
 
         public static void DeleteFile()
         {
-            foreach (var path in new[] { PrimaryPath, FallbackPath })
+            lock (SettingsDiskGate)
             {
-                try { if (File.Exists(path)) File.Delete(path); } catch (Exception ex) { AppLog.Warn("TranslationConfig.DeleteFile", ex); }
+                Current.PersistToDisk = false; // Последующий SaveOrDelete не создаст файл заново.
+                var failures = new List<Exception>();
+                try { SettingsArtifacts.Clean(SettingsDirectory, FileName); }
+                catch (Exception ex) { failures.Add(ex); }
+                // Миграционный оригинал удаляется только по точному старому пути;
+                // соседние файлы в каталоге EXE не сканируются.
+                try
+                {
+                    var attributes = File.GetAttributes(LegacyFilePath);
+                    if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+                        throw new IOException("Legacy settings file is a link or directory.");
+                    File.Delete(LegacyFilePath);
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+                catch (Exception ex) { failures.Add(ex); }
+                if (failures.Count > 0) throw new AggregateException(Loc.T(
+                    "Some saved settings could not be deleted. Check file permissions or locks.",
+                    "Часть сохранённых настроек удалить не удалось. Проверьте права доступа и блокировки файлов.",
+                    "No se pudieron eliminar algunos ajustes. Compruebe permisos y bloqueos."), failures);
             }
+        }
+
+        /// <summary>
+        /// Переносит файл настроек из папки приложения в профиль пользователя и удаляет оригинал.
+        /// Нужно один раз после обновления: до этой версии ключи лежали рядом с exe
+        /// и открытым текстом.
+        /// </summary>
+        private static void MigrateLegacyFile()
+        {
+            string legacy;
+            try
+            {
+                legacy = LegacyFilePath;
+                if (!File.Exists(legacy)) return;
+            }
+            catch (Exception ex)
+            {
+                AppLog.Debug("TranslationConfig.MigrateLegacyFile", ex);
+                return;
+            }
+
+            try
+            {
+                if (!File.Exists(SettingsFilePath))
+                {
+                    Directory.CreateDirectory(SettingsDirectory);
+                    File.Copy(legacy, SettingsFilePath, overwrite: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Копия не удалась — исходник не трогаем, иначе потеряем настройки
+                AppLog.Warn("TranslationConfig.MigrateLegacyFile", ex);
+                return;
+            }
+
+            try { File.Delete(legacy); }
+            catch (Exception ex) { AppLog.Warn("TranslationConfig.MigrateLegacyFile удаление", ex); }
         }
     }
 

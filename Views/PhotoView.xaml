@@ -125,7 +125,28 @@
         </ItemsControl.ItemTemplate>
     </ItemsControl>
 </Grid>
+        <Border x:Name="OperationStatusPanel" Grid.Row="0" Panel.ZIndex="30"
+                HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" Padding="10"
+                Background="{StaticResource PanelBrush}" Visibility="Collapsed" CornerRadius="6">
+            <StackPanel Orientation="Horizontal">
+                <ProgressBar Width="70" Height="10" IsIndeterminate="True" Margin="0,0,10,0"/>
+                <TextBlock x:Name="OperationStatusText" VerticalAlignment="Center"
+                           Foreground="{StaticResource ForegroundBrush}" MaxWidth="520" TextWrapping="Wrap"/>
+                <Button x:Name="CancelOperationButton" Content="Cancel" Margin="12,0,0,0"
+                        Click="CancelOperationButton_Click"/>
+            </StackPanel>
+        </Border>
         <!-- Нижняя панель -->
+        <StackPanel x:Name="RotationActionsPanel" Grid.Row="0" Orientation="Horizontal"
+                    HorizontalAlignment="Right" VerticalAlignment="Top" Margin="8" Panel.ZIndex="30"
+                    Background="{StaticResource PanelBrush}" Visibility="Collapsed">
+            <Button x:Name="SaveRotationButton" Content="Save rotation" Margin="4" Padding="8,4"
+                    Click="SaveRotationButton_Click" Visibility="Collapsed" Focusable="False" />
+            <Button x:Name="RestoreOriginalButton" Content="Restore original" Margin="4" Padding="8,4"
+                    Click="RestoreOriginalButton_Click" Visibility="Collapsed" Focusable="False" />
+            <Button x:Name="DiscardBackupButton" Content="Delete backup" Margin="4" Padding="8,4"
+                    Click="DiscardBackupButton_Click" Visibility="Collapsed" Focusable="False" />
+        </StackPanel>
         <Grid x:Name="BottomBar" Grid.Row="1" Background="{StaticResource PanelBrush}" Height="42">
     <Grid.ColumnDefinitions>
         <ColumnDefinition Width="Auto"/>
@@ -210,7 +231,7 @@
             Focusable="False" IsTabStop="False"/>
     <Button x:Name="FullscreenButton" Grid.Column="15" Content="Fullscreen" Margin="4,4"
             Click="FullscreenButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="TranslateSettingsButton" Grid.Column="16" Content="Translation…" Margin="4,4"
+    <Button x:Name="TranslateSettingsButton" Grid.Column="16" Content="Settings…" Margin="4,4"
             Click="TranslateSettingsButton_Click" Focusable="False" IsTabStop="False"/>
     <Button x:Name="LangButton" Grid.Column="17" Content="EN" Width="40" Margin="4,4"
             ToolTip="Switch language / Переключить язык / Cambiar idioma"

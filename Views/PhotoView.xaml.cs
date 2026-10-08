@@ -62,6 +62,9 @@ private class ThumbnailItem : INotifyPropertyChanged
     /// <summary>Миниатюра уже запрошена: при прокрутке не делаем ту же работу дважды.</summary>
     public bool LoadRequested { get; set; }
 
+    /// <summary>Сторона, с которой декодирована текущая миниатюра (для HiDPI/ресайза окна).</summary>
+    public int ThumbnailSide { get; set; }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 }
 
@@ -83,11 +86,16 @@ private sealed class ThumbnailRow
 
         private const int ThumbnailColumns = 11;
         private const int ThumbnailPreloadRows = 2;   // запас строк выше/ниже видимой области
-        private const int ThumbnailPixelWidth = 220;
+        // Сторона декодирования миниатюры — по фактическому размеру ячейки в пикселях
+        // экрана (с учётом масштаба Windows), а не фиксированные 220 px: на 4K/200%
+        // ячейка ~400 px, и 220-пиксельная миниатюра растягивалась вдвое.
+        // Значения округляются вверх до ступеней, чтобы кэш переиспользовался.
+        private static readonly int[] ThumbnailSides = { 160, 220, 320, 440, 640 };
+        private int _thumbnailDecodeSide = 220;
+        private static bool IsThumbnailSide(int side) => side > 0 && side <= ThumbnailDiskCache.MaxSide;
 
         // Общий ограничитель одновременных декодов миниатюр
-        private static readonly SemaphoreSlim ThumbnailDecodeGate =
-            new(Math.Max(2, Environment.ProcessorCount));
+
 
         private void GridViewButton_Click(object sender, RoutedEventArgs e)
 {
@@ -99,16 +107,28 @@ private sealed class ThumbnailRow
 
 private void OpenThumbnailGrid()
 {
+    if (_fileOperation != null) return;
     if (_currentIndex < 0 || _folderFiles.Count == 0) return;
 
     string currentFolder = Path.GetDirectoryName(_folderFiles[_currentIndex])!;
     ThumbnailOverlay.Visibility = Visibility.Visible;
     LoadGridFolder(currentFolder);
 }
-private void LoadGridFolder(string folderPath)
+private int _gridGeneration;
+private Dictionary<string, FolderEntry> _gridMeta = new(StringComparer.OrdinalIgnoreCase);
+
+/// <summary>
+/// Открывает папку в сетке. Листинг и сортировка идут в фоне: на сетевой папке или
+/// каталоге с тысячами файлов окно больше не замирает. Пока список собирается,
+/// видна только кнопка «назад».
+/// </summary>
+private async void LoadGridFolder(string folderPath)
 {
+    if (_fileOperation != null) return;
     _thumbnailLoadCts?.Cancel();
+    _visibleThumbnailCts?.Cancel();
     _gridCurrentFolder = folderPath;
+    int generation = ++_gridGeneration;
     _thumbnailItems.Clear();
 
     string? root = Path.GetPathRoot(folderPath);
@@ -128,26 +148,38 @@ private void LoadGridFolder(string folderPath)
         Path = parent ?? "",
         IsEnabled = parent != null
     });
+    BuildThumbnailRows();
+    ThumbnailItemsControl.ItemsSource = _thumbnailRows;
 
-    List<string> subfolders;
+    var mode = _sortMode; bool descending = _sortDescending;
+    List<string> subfolders, imageFiles;
+    Dictionary<string, FolderEntry> meta;
     try
     {
-        subfolders = Directory.EnumerateDirectories(folderPath)
-            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        (subfolders, imageFiles, meta) = await Task.Run(() =>
+        {
+            List<string> dirs;
+            try { dirs = FolderScanner.ScanDirectories(folderPath); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { AppLog.Warn("PhotoView.EnumerateDirectories", ex); dirs = new List<string>(); }
+            List<FolderEntry> entries;
+            try { entries = FolderScanner.ScanFiles(folderPath, IsSupportedImagePath); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { AppLog.Warn("PhotoView.EnumerateFiles", ex); entries = new List<FolderEntry>(); }
+            ImageSaveWriter.IndexFolder(folderPath);
+            var lookup = FolderScanner.ToLookup(entries);
+            return (dirs, SortFileSnapshot(entries.Select(e => e.Path).ToList(), mode, descending, lookup), lookup);
+        });
     }
-    catch (Exception ex) { AppLog.Warn("PhotoView.EnumerateDirectories", ex); subfolders = new List<string>(); }
-
-    List<string> imageFiles;
-    try
+    catch (Exception ex)
     {
-        imageFiles = Directory.EnumerateFiles(folderPath)
-            .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-            .ToList();
+        AppLog.Warn("PhotoView.LoadGridFolder", ex);
+        subfolders = new List<string>(); imageFiles = new List<string>(); meta = new(StringComparer.OrdinalIgnoreCase);
     }
-    catch (Exception ex) { AppLog.Warn("PhotoView.EnumerateFiles", ex); imageFiles = new List<string>(); }
 
-    imageFiles = ApplySort(imageFiles);
+    // Пока шёл листинг, пользователь мог закрыть сетку или уйти в другую папку
+    if (generation != _gridGeneration || ThumbnailOverlay.Visibility != Visibility.Visible) return;
+    if (mode != _sortMode || descending != _sortDescending)
+        imageFiles = SortFileSnapshot(imageFiles, _sortMode, _sortDescending, meta);
+    _gridMeta = meta;
 
     foreach (var folder in subfolders)
         _thumbnailItems.Add(new ThumbnailItem { Kind = ItemKind.Folder, Path = folder });
@@ -171,68 +203,38 @@ private void LoadGridFolder(string folderPath)
     Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded,
         new Action(() =>
         {
+            if (generation != _gridGeneration) return;
             ScrollThumbnailsToCurrent();
             QueueVisibleThumbnails();
         }));
 }
 private void CloseThumbnailGrid()
 {
-    _thumbnailLoadCts?.Cancel();
+    _thumbnailLoadCts?.Cancel(); _visibleThumbnailCts?.Cancel();
+    foreach (var item in _thumbnailItems) { item.Thumbnail = null; item.LoadRequested = false; }
     ThumbnailOverlay.Visibility = Visibility.Collapsed;
 }
 
-// Кэш миниатюр только в памяти (на время сессии) - на диск ничего не пишется, никаких следов вроде thumbs.db.
-// Ключ - путь, значение - миниатюра + время изменения файла (после Rotate/Crop/Strip EXIF запись сама устареет).
-private static readonly object ThumbnailCacheLock = new();
-private static readonly Dictionary<string, (long WriteTimeTicks, BitmapSource Thumb)> ThumbnailCache =
-    new(StringComparer.OrdinalIgnoreCase);
-private const int ThumbnailCacheLimit = 600; // ~90 МБ в худшем случае, дальше кэш просто очищается
+// Общая bounded-очередь и LRU для просмотра, соседей и миниатюр.
+// Несколько потоков декодирования (ядра − 1, от 2 до 4); один всегда оставлен под то,
+// что пользователь ждёт сейчас. Кэш — по объёму памяти машины: полноразмерный
+// 24-Мп снимок (96 МБ в BGRA32) теперь в него помещается, повторный зум не декодирует заново.
+private static readonly ImageLoadCoordinator<DecodedImage> ImageLoads = new(
+    DecodeFullImage, image => image.EstimatedBytes, budget: ImageCacheBudget(), maxPending: 24,
+    workers: ImageLoadCoordinator<DecodedImage>.DefaultWorkerCount);
 
-private static bool TryGetCachedThumbnail(string path, out BitmapSource? thumb)
+/// <summary>Бюджет кэша изображений: десятая часть доступной памяти, 256–768 МиБ
+/// (в 32-битном процессе — 192 МиБ: адресное пространство всего 2–4 ГБ).</summary>
+internal static long ImageCacheBudget()
 {
-    thumb = null;
-    long ticks = SafeWriteTimeTicks(path);
-    lock (ThumbnailCacheLock)
-    {
-        if (ThumbnailCache.TryGetValue(path, out var entry) && entry.WriteTimeTicks == ticks)
-        {
-            thumb = entry.Thumb;
-            return true;
-        }
-    }
-    return false;
+    const long MiB = 1024L * 1024;
+    if (!Environment.Is64BitProcess) return 192 * MiB;
+    long total = 0;
+    try { total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes; }
+    catch (Exception ex) { AppLog.Debug("PhotoView.ImageCacheBudget", ex); }
+    return total <= 0 ? 256 * MiB : Math.Clamp(total / 10, 256 * MiB, 768 * MiB);
 }
-
-private static void CacheThumbnail(string path, BitmapSource thumb)
-{
-    long ticks = SafeWriteTimeTicks(path);
-    lock (ThumbnailCacheLock)
-    {
-        if (ThumbnailCache.Count >= ThumbnailCacheLimit)
-        {
-            // Выбрасываем половину записей вместо полной очистки:
-            // раньше в папках больше лимита кэш обнулялся целиком и переставал помогать
-            var toRemove = ThumbnailCache.Keys.Take(ThumbnailCacheLimit / 2).ToList();
-            foreach (var key in toRemove) ThumbnailCache.Remove(key);
-        }
-        ThumbnailCache[path] = (ticks, thumb);
-    }
-}
-
-private static long SafeWriteTimeTicks(string path)
-{
-    try { return File.GetLastWriteTimeUtc(path).Ticks; }
-    catch (Exception ex) { AppLog.Debug("PhotoView.SafeWriteTimeTicks", ex); return 0; }
-}
-
-// --- Упреждающее декодирование соседних фото ---
-// Кэш только в памяти (на диск ничего не пишется, как и кэш миниатюр).
-// Запись инвалидируется по времени изменения файла: после Rotate/Crop/Strip EXIF
-// или замены файла извне устаревшая копия не используется.
-private static readonly object PrefetchLock = new();
-private static readonly Dictionary<string, (long WriteTimeTicks, DecodedImage Decoded)> PrefetchCache =
-    new(StringComparer.OrdinalIgnoreCase);
-private const int PrefetchCacheLimit = 4; // текущие соседи + небольшой запас
+private CancellationTokenSource? _prefetchCts;
 
 /// <summary>Готовое к показу изображение плюс размеры и вес оригинала.</summary>
 private sealed class DecodedImage
@@ -243,6 +245,7 @@ private sealed class DecodedImage
     // чем у Image: для показа фото декодируется с ограничением по стороне.
     public int NaturalWidth;
     public int NaturalHeight;
+    public long EstimatedBytes;
 }
 
 // Ограничение большей стороны при декодировании для показа. Раньше
@@ -256,160 +259,61 @@ private static int _decodeSideCap = 3072;
 /// (0 - без ограничения, полный размер). EXIF-ориентация применяется на лету,
 /// сам файл не меняется.
 /// </summary>
-private static DecodedImage DecodeFullImage(string path, int maxSide)
+private static DecodedImage DecodeFullImage(string path, int maxSide, CancellationToken token = default)
 {
-    byte[] fileBytes = File.ReadAllBytes(path);
+    bool thumbnail = IsThumbnailSide(maxSide);
+    // Миниатюра из дискового кэша (если пользователь его включил)
+    if (thumbnail && ThumbnailDiskCache.TryLoad(path, maxSide, token) is { } cached)
+        return new DecodedImage { Image = cached.Image, SizeBytes = cached.FileBytes,
+            NaturalWidth = cached.NaturalWidth, NaturalHeight = cached.NaturalHeight,
+            EstimatedBytes = PixelBytes(cached.Image) };
 
-    int rawWidth = 0, rawHeight = 0, orientation = 1;
-    try
-    {
-        // Заголовки без распаковки пикселей: нужны размер и ориентация
-        using var metaStream = new MemoryStream(fileBytes);
-        var metaDecoder = BitmapDecoder.Create(metaStream,
-            BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
-        var metaFrame = metaDecoder.Frames[0];
-        rawWidth = metaFrame.PixelWidth;
-        rawHeight = metaFrame.PixelHeight;
-        orientation = ExifOrientationService.GetOrientation(metaFrame);
-    }
-    catch (Exception ex)
-    {
-        // не удалось прочитать заголовки - декодируем как есть, без ограничения
-        AppLog.Debug("PhotoView.ReadImageHeaders", ex);
-    }
-
-    // DecodePixelWidth/Height выполняет уменьшение внутри декодера: лишние
-    // пиксели не выделяются вообще. Задаём только одну сторону - вторая
-    // считается сама, пропорции сохраняются.
-    int decodeWidth = 0, decodeHeight = 0;
-    if (maxSide > 0 && rawWidth > 0 && rawHeight > 0)
-    {
-        if (rawWidth >= rawHeight && rawWidth > maxSide) decodeWidth = maxSide;
-        else if (rawHeight > rawWidth && rawHeight > maxSide) decodeHeight = maxSide;
-    }
-
-    // SafeImageDecoder переживает повреждённый ICC-профиль/метаданные
-    // (ArgumentException в ColorContext.GetColorContextsHelper): файл открывается без них
-    BitmapSource bmp = SafeImageDecoder.DecodeScaled(fileBytes, decodeWidth, decodeHeight);
-
-    BitmapSource display = ExifOrientationService.ApplyOrientation(bmp, orientation);
-    if (display.CanFreeze) display.Freeze();
-
-    // Поворот на 90/270 меняет стороны местами
-    bool swapped = orientation is 5 or 6 or 7 or 8;
-    int naturalWidth = swapped ? rawHeight : rawWidth;
-    int naturalHeight = swapped ? rawWidth : rawHeight;
-    if (naturalWidth <= 0 || naturalHeight <= 0)
-    {
-        naturalWidth = display.PixelWidth;
-        naturalHeight = display.PixelHeight;
-    }
-
-    return new DecodedImage
-    {
-        Image = display,
-        SizeBytes = fileBytes.LongLength,
-        NaturalWidth = naturalWidth,
-        NaturalHeight = naturalHeight
-    };
+    // Пиксели копируются в собственный BGRA32-буфер внутри декодера (в пределах общего
+    // бюджета памяти): вес в кэше — фактический (ширина × высота × 4), а не прежние
+    // «16 байт на пиксель оригинала», из-за которых 24 Мп (384 МБ по оценке) не
+    // помещались в кэш и каждое приближение декодировало файл заново.
+    var decoded = SafeImageDecoder.LoadDecoded(path, maxSide, token: token,
+        preferEmbeddedThumbnail: thumbnail, detachToBgra32: true);
+    if (thumbnail)
+        ThumbnailDiskCache.Store(path, maxSide, decoded.Image, decoded.NaturalWidth, decoded.NaturalHeight, decoded.FileBytes);
+    return new DecodedImage { Image = decoded.Image, SizeBytes = decoded.FileBytes,
+        NaturalWidth = decoded.NaturalWidth, NaturalHeight = decoded.NaturalHeight,
+        EstimatedBytes = PixelBytes(decoded.Image) };
 }
 
-private static bool TryGetPrefetched(string path, out DecodedImage decoded)
-{
-    decoded = null!;
+private static long PixelBytes(BitmapSource image) =>
+    checked((long)image.PixelWidth * image.PixelHeight * Math.Max(4, (image.Format.BitsPerPixel + 7) / 8) + 1024);
 
-    long ticks = SafeWriteTimeTicks(path);
-    lock (PrefetchLock)
-    {
-        if (PrefetchCache.TryGetValue(path, out var entry) && entry.WriteTimeTicks == ticks)
-        {
-            decoded = entry.Decoded;
-            return true;
-        }
-    }
-    return false;
+private void CancelPrefetch()
+{
+    _prefetchCts?.Cancel(); _prefetchCts?.Dispose(); _prefetchCts = null;
 }
+/// <summary>Сколько соседних фото готовить заранее по направлению листания и назад.</summary>
+private const int PrefetchAhead = 2, PrefetchBehind = 1;
+private bool _lastNavigationForward = true;
 
 private void PrefetchNeighbors()
 {
-    if (_currentIndex < 0 || _folderFiles.Count < 2) return;
-
-    int next = (_currentIndex + 1) % _folderFiles.Count;
-    int prev = (_currentIndex - 1 + _folderFiles.Count) % _folderFiles.Count;
-
-    var candidates = next == prev
-        ? new[] { _folderFiles[next] }
-        : new[] { _folderFiles[next], _folderFiles[prev] };
-
-    foreach (var candidate in candidates)
-    {
-        string path = candidate;
-        if (Path.GetExtension(path).ToLowerInvariant() == ".gif")
-            continue; // GIF декодируется аниматором заново - кэшировать нечего
-
-        long ticks = SafeWriteTimeTicks(path);
-        lock (PrefetchLock)
-        {
-            if (PrefetchCache.TryGetValue(path, out var entry) && entry.WriteTimeTicks == ticks)
-                continue; // уже декодирован и файл не менялся
-        }
-
-        Task.Run(() =>
-        {
-            try
-            {
-                var decoded = DecodeFullImage(path, _decodeSideCap);
-                if (!decoded.Image.IsFrozen) return; // незамороженный объект нельзя передавать между потоками
-
-                lock (PrefetchLock)
-                {
-                    // Кэш крошечный, а соседи перечитываются мгновенно -
-                    // при переполнении просто начинаем заново
-                    if (PrefetchCache.Count >= PrefetchCacheLimit)
-                        PrefetchCache.Clear();
-
-                    PrefetchCache[path] = (SafeWriteTimeTicks(path), decoded);
-                }
-            }
-            catch (Exception ex)
-            {
-                // повреждённый/занятый файл - ошибку пользователь увидит при обычном открытии
-                AppLog.Debug("PhotoView.Prefetch", ex, AppLog.Describe(path));
-            }
-        });
-    }
+    CancelPrefetch();
+    if (_currentIndex < 0 || _folderFiles.Count < 2 || _fileOperation != null) return;
+    _prefetchCts = new CancellationTokenSource();
+    var token = _prefetchCts.Token;
+    // Порядок важен: очередь отдаёт фоновые задания по порядку, ближайшее по ходу — первым
+    int step = _lastNavigationForward ? 1 : -1, count = _folderFiles.Count;
+    var order = new List<int>();
+    for (int i = 1; i <= PrefetchAhead; i++) order.Add(_currentIndex + step * i);
+    for (int i = 1; i <= PrefetchBehind; i++) order.Add(_currentIndex - step * i);
+    foreach (string path in order.Select(i => _folderFiles[((i % count) + count) % count])
+                 .Where(p => !string.Equals(p, _folderFiles[_currentIndex], StringComparison.OrdinalIgnoreCase))
+                 .Distinct(StringComparer.OrdinalIgnoreCase))
+        if (!string.Equals(Path.GetExtension(path), ".gif", StringComparison.OrdinalIgnoreCase))
+            _ = PrefetchOneAsync(path, token);
 }
-
-private static BitmapSource? DecodeThumbnail(string path, int pixelWidth)
+private static async Task PrefetchOneAsync(string path, CancellationToken token)
 {
-    try
-    {
-        byte[] bytes = File.ReadAllBytes(path);
-
-        int orientation = 1;
-        try
-        {
-            using var metaStream = new MemoryStream(bytes);
-            var metaDecoder = BitmapDecoder.Create(metaStream,
-                BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
-            orientation = ExifOrientationService.GetOrientation(metaDecoder.Frames[0]);
-        }
-        catch (Exception ex)
-        {
-            // не удалось прочитать ориентацию - покажем миниатюру как есть
-            AppLog.Debug("PhotoView.DecodeThumbnail orientation", ex);
-        }
-
-        // тот же устойчивый декодер: миниатюра не должна пропадать из-за битого профиля
-        BitmapSource bmp = SafeImageDecoder.DecodeScaled(bytes, pixelWidth, 0);
-
-        return ExifOrientationService.ApplyOrientation(bmp, orientation);
-    }
-    catch (Exception ex)
-    {
-        AppLog.Debug("PhotoView.DecodeThumbnail", ex);
-        return null;
-    }
+    try { await ImageLoads.RequestAsync(path, _decodeSideCap, foreground: false, token).ConfigureAwait(false); }
+    catch (OperationCanceledException) { }
+    catch (Exception ex) { AppLog.Debug("PhotoView.Prefetch", ex); }
 }
 
 /// <summary>Собирает плоский список ячеек в строки по ThumbnailColumns штук.</summary>
@@ -505,60 +409,54 @@ private void ThumbnailScroll_ScrollChanged(object sender, ScrollChangedEventArgs
 /// Ставит в очередь декодирование миниатюр только для видимых строк (плюс небольшой
 /// запас). Раньше при открытии папки декодировались миниатюры всех файлов сразу.
 /// </summary>
+private CancellationTokenSource? _visibleThumbnailCts;
 private void QueueVisibleThumbnails()
 {
-    if (_thumbnailRows.Count == 0) return;
-    if (ThumbnailOverlay.Visibility != Visibility.Visible) return;
-
-    var token = _thumbnailLoadCts?.Token ?? CancellationToken.None;
-    if (token.IsCancellationRequested) return;
-
+    _visibleThumbnailCts?.Cancel(); _visibleThumbnailCts?.Dispose(); _visibleThumbnailCts = null;
+    if (_thumbnailRows.Count == 0 || ThumbnailOverlay.Visibility != Visibility.Visible) return;
+    var gridToken = _thumbnailLoadCts?.Token ?? new CancellationToken(true);
+    if (gridToken.IsCancellationRequested) return;
+    _visibleThumbnailCts = CancellationTokenSource.CreateLinkedTokenSource(gridToken);
     int visibleRows = _thumbnailVisibleRows > 0 ? (int)Math.Ceiling(_thumbnailVisibleRows) : 6;
     int firstRow = (int)Math.Floor(_thumbnailFirstVisibleRow);
-
     int from = Math.Max(0, firstRow - ThumbnailPreloadRows);
     int to = Math.Min(_thumbnailRows.Count - 1, firstRow + visibleRows + ThumbnailPreloadRows);
-
-    for (int r = from; r <= to; r++)
-        foreach (var item in _thumbnailRows[r].Items)
-            StartThumbnailLoad(item, token);
+    // Сначала видимые строки, потом запас сверху и снизу
+    int lastVisible = Math.Min(_thumbnailRows.Count - 1, firstRow + visibleRows);
+    var ordered = new List<ThumbnailItem>();
+    for (int r = Math.Max(0, firstRow); r <= lastVisible; r++) ordered.AddRange(_thumbnailRows[r].Items);
+    for (int r = from; r <= to; r++) if (r < firstRow || r > lastVisible) ordered.AddRange(_thumbnailRows[r].Items);
+    var wanted = new HashSet<ThumbnailItem>(ordered);
+    // Binding references must not retain every thumbnail ever scrolled past outside the LRU budget.
+    foreach (var item in _thumbnailItems)
+        if (!wanted.Contains(item)) { item.Thumbnail = null; item.LoadRequested = false; item.ThumbnailSide = 0; }
+    _ = LoadVisibleThumbnailsAsync(ordered, _thumbnailDecodeSide, _visibleThumbnailCts.Token);
 }
-
-private void StartThumbnailLoad(ThumbnailItem item, CancellationToken token)
+private async Task LoadVisibleThumbnailsAsync(IReadOnlyList<ThumbnailItem> items, int side, CancellationToken token)
 {
-    if (item.Kind != ItemKind.Image || item.LoadRequested || item.Thumbnail != null) return;
-
-    if (TryGetCachedThumbnail(item.Path, out var cached))
+    // Один производитель на видимую область, но несколько миниатюр в работе сразу —
+    // по числу фоновых потоков очереди (раньше строго по одной).
+    int parallel = Math.Max(1, ImageLoads.Workers - 1);
+    var running = new List<Task>(parallel);
+    foreach (var item in items)
     {
+        if (token.IsCancellationRequested) break;
+        if (item.Kind != ItemKind.Image || (item.Thumbnail != null && item.ThumbnailSide >= side)) continue;
         item.LoadRequested = true;
-        item.Thumbnail = cached; // мгновенно, без обращения к диску
-        return;
+        running.Add(LoadThumbnailAsync(item, side, token));
+        if (running.Count >= parallel) running.Remove(await Task.WhenAny(running));
     }
-
-    item.LoadRequested = true;
-    _ = LoadThumbnailAsync(item, token);
+    await Task.WhenAll(running);
 }
 
-private async Task LoadThumbnailAsync(ThumbnailItem item, CancellationToken token)
+private async Task LoadThumbnailAsync(ThumbnailItem item, int side, CancellationToken token)
 {
     try
     {
-        // Продолжения возвращаются в UI-поток, поэтому Thumbnail ставим напрямую
-        await ThumbnailDecodeGate.WaitAsync(token);
-        try
-        {
-            if (token.IsCancellationRequested) return;
-
-            var thumb = await Task.Run(() => DecodeThumbnail(item.Path, ThumbnailPixelWidth), token);
-            if (thumb == null || token.IsCancellationRequested) return;
-
-            CacheThumbnail(item.Path, thumb);
-            item.Thumbnail = thumb;
-        }
-        finally
-        {
-            ThumbnailDecodeGate.Release();
-        }
+        var decoded = await ImageLoads.RequestAsync(item.Path, side, foreground: false, token);
+        if (token.IsCancellationRequested) { item.LoadRequested = false; return; }
+        item.Thumbnail = decoded.Image;
+        item.ThumbnailSide = side;
     }
     catch (Exception ex)
     {
@@ -587,12 +485,13 @@ private void ThumbnailItem_MouseLeftButtonDown(object sender, MouseButtonEventAr
 }
 private void OpenFileFromGrid(string path)
 {
+    if (_fileOperation != null) return;
     var folder = Path.GetDirectoryName(path)!;
-    _folderFiles = Directory.EnumerateFiles(folder)
-        .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-        .ToList();
-
-    SortFolderFiles(); // сохраняет текущий выбранный режим сортировки, не сбрасывает его
+    // Список папки уже собран сеткой (в фоне) — повторно диск не обходим
+    var files = _thumbnailItems.Where(i => i.Kind == ItemKind.Image).Select(i => i.Path).ToList();
+    _folderMeta = _gridMeta;
+    _folderFiles = SortFileSnapshot(files, _sortMode, _sortDescending, _folderMeta); // текущий режим сортировки
+    _folderListLoading = false;
 
     _currentIndex = _folderFiles.FindIndex(f =>
         string.Equals(f, path, StringComparison.OrdinalIgnoreCase));
@@ -605,6 +504,7 @@ private void OpenFileFromGrid(string path)
 
     CloseThumbnailGrid();
     ShowCurrent();
+    WatchFolder(folder);
 }
 private void ThumbnailOverlay_SizeChanged(object sender, SizeChangedEventArgs e)
 {
@@ -622,11 +522,27 @@ private void UpdateThumbnailItemSize()
 
     foreach (var item in _thumbnailItems)
         item.CellSize = itemSize;
+
+    // Сторона декодирования по реальным пикселям ячейки
+    double scale = 1;
+    try { scale = VisualTreeHelper.GetDpi(this).DpiScaleX; }
+    catch (Exception ex) { AppLog.Debug("PhotoView.ThumbnailDpi", ex); }
+    int needed = (int)Math.Ceiling(itemSize * Math.Max(1, scale));
+    int side = ThumbnailSides.FirstOrDefault(s => s >= needed);
+    if (side == 0) side = ThumbnailSides[^1];
+    if (side != _thumbnailDecodeSide)
+    {
+        bool larger = side > _thumbnailDecodeSide;
+        _thumbnailDecodeSide = side;
+        // Ячейки выросли (развернули окно, перенесли на 4K) — видимые миниатюры
+        // перезагружаются в большем размере; при уменьшении хватает уже загруженных.
+        if (larger && ThumbnailOverlay.Visibility == Visibility.Visible) QueueVisibleThumbnails();
+    }
 }
        internal static readonly string[] SupportedExtensions =
 {
     ".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp", ".tiff", ".tif", ".gif",
-    ".heic", ".cr2", ".nef", ".arw"
+    ".heic", ".heif", ".hif", ".cr2", ".nef", ".arw"
 };
 
         private List<string> _folderFiles = new();
@@ -634,9 +550,29 @@ private void UpdateThumbnailItemSize()
         private bool _isFullscreen;
         private bool _windowHooked;
         
-        private enum SortMode { Name, DateModified, Size, Type }
-        private SortMode _sortMode = SortMode.Name;
+        // Тот же порядок, что FileSortKey и пункты выпадающего списка.
+        private enum SortMode { Name = 0, DateModified = 1, Size = 2, Type = 3 }
+        private SortMode _sortMode = SortMode.DateModified;
         private bool _sortDescending = true;
+        private bool _applyingSortPreference, _sortUiReady;
+
+        /// <summary>Ставит сортировку из настроек и показывает её на панели, ничего не запоминая.</summary>
+        private (FileSortKey Key, bool Descending)? _appliedSortPreference;
+
+        private bool ApplySortPreference(bool onlyIfChanged = false)
+        {
+            var prefs = AppPreferences.Current;
+            var wanted = (prefs.PhotoSort, prefs.PhotoSortDescending);
+            if (onlyIfChanged && _appliedSortPreference == wanted) return false;
+            _appliedSortPreference = wanted;
+            _sortMode = (SortMode)(int)prefs.PhotoSort;
+            _sortDescending = prefs.PhotoSortDescending;
+            _applyingSortPreference = true;
+            try { SortModeCombo.SelectedIndex = (int)_sortMode; }
+            finally { _applyingSortPreference = false; }
+            SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+            return true;
+        }
         private long _currentFileSizeBytes;
         private int _currentWidth;
         private int _currentHeight;
@@ -687,6 +623,18 @@ private void UpdateThumbnailItemSize()
     Loc.LanguageChanged += ApplyLocalization;
     ApplyLocalization();
 
+    // Сортировка из настроек (по умолчанию — по дате, новые первыми); после сохранения
+    // окна настроек она сразу применяется к открытой папке.
+    ApplySortPreference();
+    _sortUiReady = true;
+    AppPreferences.Changed += () =>
+    {
+        // Только если сортировку в настройках действительно поменяли: иначе OK в окне
+        // настроек сбрасывал бы временный выбор на панели (при выключенном запоминании).
+        if (_fileOperation != null || !ApplySortPreference(onlyIfChanged: true)) return;
+        if (_folderFiles.Count > 0) ReapplySort();
+    };
+
     Loaded += (_, _) =>
     {
         Dispatcher.BeginInvoke(
@@ -701,6 +649,7 @@ private void UpdateThumbnailItemSize()
             if (window != null)
             {
                 window.Deactivated += (_, __) => CommitRename();
+                window.Closing += OperationWindowClosing;
                 _windowHooked = true;
             }
         }
@@ -709,6 +658,7 @@ private void UpdateThumbnailItemSize()
 
         public void OpenFile(string path)
 {
+    if (_fileOperation != null) return;
     if (!File.Exists(path)) return;
 
     // Файл может прийти через drag&drop в любом состоянии интерфейса - приводим его в порядок
@@ -717,53 +667,206 @@ private void UpdateThumbnailItemSize()
     CommitRename();
 
     var folder = Path.GetDirectoryName(path)!;
-    _folderFiles = Directory.EnumerateFiles(folder)
-        .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-        .ToList();
 
-    // Сбрасываем сортировку на "Дата изменения, по убыванию" (новые первыми) для каждой новой открытой папки
-    _sortMode = SortMode.DateModified;
-    _sortDescending = true;
-    SortModeCombo.SelectedIndex = 1;
-    SortDirectionButton.Content = "\u2193";
+    // Каждая новая папка открывается в сортировке из настроек (по умолчанию —
+    // по дате, новые первыми; с запоминанием — последняя выбранная на панели).
+    ApplySortPreference();
 
-    SortFolderFiles();
+    // Фото показывается сразу, а список папки собирается и сортируется в фоне.
+    // Раньше листинг и сортировка по дате (по запросу к диску на каждый файл) шли
+    // прямо в потоке интерфейса: на сетевой папке или каталоге с тысячами файлов
+    // окно замирало до конца обхода.
+    _folderFiles = new List<string> { path };
+    _folderMeta = new Dictionary<string, FolderEntry>(StringComparer.OrdinalIgnoreCase);
+    _currentIndex = 0;
+    _folderListLoading = true;
+    ShowCurrent();
 
-    _currentIndex = _folderFiles.FindIndex(f =>
-        string.Equals(f, path, StringComparison.OrdinalIgnoreCase));
+    WatchFolder(folder);
+    _ = ReloadFolderListAsync(folder);
+}
 
-    if (_currentIndex < 0)
+// ------------------------------------------------------------------ список папки
+
+private Dictionary<string, FolderEntry> _folderMeta = new(StringComparer.OrdinalIgnoreCase);
+private bool _folderListLoading;
+private int _folderListGeneration;
+private CancellationTokenSource? _folderScanCts;
+private FileSystemWatcher? _folderWatcher;
+private string? _watchedFolder;
+private System.Windows.Threading.DispatcherTimer? _folderRescanTimer;
+
+private static readonly HashSet<string> SupportedExtensionSet = new(SupportedExtensions, StringComparer.OrdinalIgnoreCase);
+private static bool IsSupportedImagePath(string path) => SupportedExtensionSet.Contains(Path.GetExtension(path));
+
+/// <summary>
+/// Фоновый листинг и сортировка папки; результат применяется к списку, если за это
+/// время пользователь не открыл другую папку. Текущий файл сохраняется на месте.
+/// Во время файловой операции применение откладывается до её завершения.
+/// </summary>
+private async Task ReloadFolderListAsync(string folder)
+{
+    int generation = ++_folderListGeneration;
+    _folderScanCts?.Cancel(); _folderScanCts?.Dispose();
+    _folderScanCts = new CancellationTokenSource();
+    var token = _folderScanCts.Token;
+    var mode = _sortMode; bool descending = _sortDescending;
+    List<string> sorted; Dictionary<string, FolderEntry> meta;
+    try
     {
-        _folderFiles = new List<string> { path };
-        _currentIndex = 0;
+        (sorted, meta) = await Task.Run(() =>
+        {
+            var entries = FolderScanner.ScanFiles(folder, IsSupportedImagePath, token);
+            ImageSaveWriter.IndexFolder(folder); // «Вернуть оригинал» и после перезапуска
+            var lookup = FolderScanner.ToLookup(entries);
+            return (SortFileSnapshot(entries.Select(e => e.Path).ToList(), mode, descending, lookup), lookup);
+        }, token);
+    }
+    catch (OperationCanceledException) { return; }
+    catch (Exception ex)
+    {
+        // Папка недоступна (сеть пропала и т. п.): остаётся то, что уже показано
+        AppLog.Warn("PhotoView.ReloadFolderList", ex);
+        if (generation == _folderListGeneration) { _folderListLoading = false; RefreshCurrentLabels(); }
+        return;
     }
 
-    ShowCurrent();
+    if (generation != _folderListGeneration || token.IsCancellationRequested) return;
+    if (!string.Equals(_watchedFolder, folder, StringComparison.OrdinalIgnoreCase)) return;
+    if (_fileOperation != null) { ScheduleFolderRescan(); return; }
+
+    if (mode != _sortMode || descending != _sortDescending)
+        sorted = SortFileSnapshot(sorted, _sortMode, _sortDescending, meta);
+    string? current = _currentIndex >= 0 && _currentIndex < _folderFiles.Count ? _folderFiles[_currentIndex] : null;
+    if (current == null)
+    {
+        // Сейчас ничего не показано (экран «нет доступных файлов») — сами файлы не открываем
+        _folderListLoading = false;
+        return;
+    }
+    int index = FolderScanner.MergeKeepingCurrent(sorted, current,
+        list => SortFileSnapshot(list, _sortMode, _sortDescending, meta), out var merged);
+    _folderFiles = merged;
+    _folderMeta = meta;
+    _currentIndex = index >= 0 ? index : (merged.Count > 0 ? 0 : -1);
+    _folderListLoading = false;
+    RefreshCurrentLabels();
+    RefreshRotationUi(); // резервные копии найдены при сканировании — показать «Вернуть оригинал»
+    PrefetchNeighbors();
+}
+
+private void RefreshCurrentLabels()
+{
+    if (_currentIndex >= 0 && _currentIndex < _folderFiles.Count) RefreshFileLabels(_folderFiles[_currentIndex]);
+}
+
+/// <summary>
+/// Следит за папкой открытого фото: новые, удалённые и переименованные снаружи файлы
+/// попадают в список (раньше список устаревал до повторного открытия). События
+/// склеиваются в одну пересборку через 0,5 с. Если наблюдение невозможно (некоторые
+/// сетевые ресурсы), всё работает как раньше, без автообновления.
+/// </summary>
+private void WatchFolder(string folder)
+{
+    if (_folderWatcher != null && string.Equals(_watchedFolder, folder, StringComparison.OrdinalIgnoreCase)) return;
+    StopWatchingFolder();
+    _watchedFolder = folder;
+    try
+    {
+        var watcher = new FileSystemWatcher(folder)
+        {
+            IncludeSubdirectories = false,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            InternalBufferSize = 64 * 1024
+        };
+        watcher.Created += FolderWatcher_Changed;
+        watcher.Deleted += FolderWatcher_Changed;
+        watcher.Changed += FolderWatcher_Changed;
+        watcher.Renamed += FolderWatcher_Changed;
+        // Переполнение буфера событий или обрыв связи — просто пересобираем список целиком
+        watcher.Error += (_, e) =>
+        {
+            AppLog.Debug("PhotoView.FolderWatcher", e.GetException());
+            Dispatcher.BeginInvoke(new Action(ScheduleFolderRescan));
+        };
+        watcher.EnableRaisingEvents = true;
+        _folderWatcher = watcher;
+    }
+    catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException or PlatformNotSupportedException)
+    {
+        AppLog.Debug("PhotoView.WatchFolder", ex);
+    }
+}
+
+private void StopWatchingFolder()
+{
+    var watcher = _folderWatcher;
+    _folderWatcher = null;
+    _watchedFolder = null;
+    _folderRescanTimer?.Stop();
+    if (watcher == null) return;
+    try { watcher.EnableRaisingEvents = false; watcher.Dispose(); }
+    catch (Exception ex) { AppLog.Debug("PhotoView.StopWatchingFolder", ex); }
+}
+
+// Вызывается в потоке пула: только фильтр и передача в UI-поток
+private void FolderWatcher_Changed(object sender, FileSystemEventArgs e)
+{
+    bool relevant = IsSupportedImagePath(e.FullPath) ||
+                    (e is RenamedEventArgs renamed && IsSupportedImagePath(renamed.OldFullPath));
+    if (relevant) Dispatcher.BeginInvoke(new Action(ScheduleFolderRescan));
+}
+
+private void ScheduleFolderRescan()
+{
+    if (_watchedFolder == null) return;
+    if (_folderRescanTimer == null)
+    {
+        _folderRescanTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _folderRescanTimer.Tick += (_, _) =>
+        {
+            // Во время файловой операции список не трогаем — повторим после неё
+            if (_fileOperation != null) return;
+            _folderRescanTimer!.Stop();
+            if (_watchedFolder != null) _ = ReloadFolderListAsync(_watchedFolder);
+        };
+    }
+    _folderRescanTimer.Stop();
+    _folderRescanTimer.Start();
 }
 
 private void SortFolderFiles()
 {
-    _folderFiles = ApplySort(_folderFiles);
+    _folderFiles = SortFileSnapshot(_folderFiles, _sortMode, _sortDescending, _folderMeta);
 }
 
-private List<string> ApplySort(List<string> files)
+/// <summary>
+/// Сортировка снимка списка. meta — размер и дата из листинга папки: с ними сортировка
+/// не обращается к диску (раньше — запрос на каждый файл, в потоке интерфейса).
+/// Для файлов без метаданных (добавлены операциями) — обычный запрос.
+/// </summary>
+private static List<string> SortFileSnapshot(List<string> files, SortMode mode, bool descending,
+    IReadOnlyDictionary<string, FolderEntry>? meta = null)
 {
-    IEnumerable<string> query = files;
-
-    query = _sortMode switch
+    DateTime Written(string f) => meta != null && meta.TryGetValue(f, out var e) ? e.LastWriteUtc : SafeLastWrite(f);
+    long Length(string f) => meta != null && meta.TryGetValue(f, out var e) ? e.Length : SafeFileLength(f);
+    IEnumerable<string> query = mode switch
     {
-        SortMode.Name => query.OrderBy(f => f, StringComparer.OrdinalIgnoreCase),
-        SortMode.DateModified => query.OrderBy(f => File.GetLastWriteTime(f)),
-        SortMode.Size => query.OrderBy(f => SafeFileLength(f)),
-        SortMode.Type => query.OrderBy(f => Path.GetExtension(f).ToLowerInvariant())
-                               .ThenBy(f => f, StringComparer.OrdinalIgnoreCase),
-        _ => query
+        // Естественный порядок (img2 < img10), как в Проводнике. Равные дата/размер —
+        // тоже по имени, иначе порядок зависел бы от порядка листинга папки.
+        SortMode.Name => files.OrderBy(f => f, NaturalStringComparer.FileName),
+        SortMode.DateModified => files.OrderBy(Written).ThenBy(f => f, NaturalStringComparer.FileName),
+        SortMode.Size => files.OrderBy(Length).ThenBy(f => f, NaturalStringComparer.FileName),
+        SortMode.Type => files.OrderBy(f => Path.GetExtension(f).ToLowerInvariant(), StringComparer.Ordinal)
+                              .ThenBy(f => f, NaturalStringComparer.FileName),
+        _ => files
     };
-
-    if (_sortDescending)
-        query = query.Reverse();
-
-    return query.ToList();
+    return (descending ? query.Reverse() : query).ToList();
+}
+private static DateTime SafeLastWrite(string path)
+{
+    try { return File.GetLastWriteTimeUtc(path); }
+    catch (Exception ex) { AppLog.Debug("PhotoView.SafeLastWrite", ex); return DateTime.MinValue; }
 }
 
 private static long SafeFileLength(string path)
@@ -776,6 +879,10 @@ private static long SafeFileLength(string path)
             if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
 
             var path = _folderFiles[_currentIndex];
+            if (!string.Equals(_viewRotationPath, path, StringComparison.OrdinalIgnoreCase))
+            { _viewRotationDegrees = 0; _viewRotationPath = path; }
+            _viewBase = null;
+            UpdateOperationControls();
 
             // Прошлая загрузка больше не нужна: при быстром листании фоновые
             // декоды отменяются и не занимают процессор
@@ -803,17 +910,10 @@ private static long SafeFileLength(string path)
 
             if (ext == ".gif")
             {
+                CancelPrefetch();
                 MainImage.Source = null;
                 ShowLoadingLabels(path);
                 _ = LoadGifAsync(path, generation, token);
-                return;
-            }
-
-            // Упреждающе декодированная копия ставится сразу - листание остаётся мгновенным
-            if (TryGetPrefetched(path, out var prefetched))
-            {
-                ApplyDecodedImage(prefetched, path);
-                PrefetchNeighbors();
                 return;
             }
 
@@ -835,11 +935,15 @@ private static long SafeFileLength(string path)
 
         private void ApplyDecodedImage(DecodedImage decoded, string path)
         {
-            MainImage.Source = decoded.Image;
-            _displayPixelWidth = decoded.Image.PixelWidth;
+            _viewBase = decoded;
+            var shown = WithViewRotation(decoded.Image);
+            MainImage.Source = shown;
+            _displayPixelWidth = shown.PixelWidth;
             _currentFileSizeBytes = decoded.SizeBytes;
-            _currentWidth = decoded.NaturalWidth;
-            _currentHeight = decoded.NaturalHeight;
+            bool swap = _viewRotationDegrees is 90 or 270;
+            _currentWidth = swap ? decoded.NaturalHeight : decoded.NaturalWidth;
+            _currentHeight = swap ? decoded.NaturalWidth : decoded.NaturalHeight;
+            RefreshRotationUi();
 
             UpdateGifButtonVisibility();
             RefreshFileLabels(path);
@@ -849,12 +953,13 @@ private static long SafeFileLength(string path)
 /// Декодирует фото в фоновом потоке. Поколение и токен защищают от гонки:
 /// результат применяется только если пользователь всё ещё смотрит этот файл.
 /// </summary>
-private async Task LoadImageAsync(string path, int generation, CancellationToken token,
-    SniffedFormat disguisedAs = SniffedFormat.Unknown)
+private async Task LoadImageAsync(string path, int generation, CancellationToken token)
 {
     try
     {
-        var decoded = await Task.Run(() => DecodeFullImage(path, _decodeSideCap), token);
+        var request = ImageLoads.RequestAsync(path, _decodeSideCap, foreground: true, token);
+        CancelPrefetch();
+        var decoded = await request;
         if (token.IsCancellationRequested || generation != _showGeneration) return;
 
         ApplyDecodedImage(decoded, path);
@@ -871,10 +976,7 @@ private async Task LoadImageAsync(string path, int generation, CancellationToken
     {
         AppLog.Error("PhotoView.ShowCurrent", ex, AppLog.Describe(path));
         if (generation != _showGeneration) return;
-
-        // disguisedAs заполнено, когда сюда пришёл «гиф», оказавшийся другим форматом:
-        // сообщение договаривает, что внутри на самом деле
-        ShowOpenError(path, ex, disguisedAs);
+        ShowOpenError(path, ex);
     }
 }
 
@@ -894,11 +996,12 @@ private async Task LoadGifAsync(string path, int generation, CancellationToken t
         _gifAnimator.Start();
         GifPlayPauseButton.Content = "\u2759\u2759";
 
-        // Первый кадр уже установлен аниматором - берём размеры из него
+        // Для координат обрезки и метаданных нужны исходные размеры,
+        // а для качества масштабирования — размеры показанной копии.
+        _currentWidth = animator.NaturalWidth;
+        _currentHeight = animator.NaturalHeight;
         if (MainImage.Source is BitmapSource gifSource)
         {
-            _currentWidth = gifSource.PixelWidth;
-            _currentHeight = gifSource.PixelHeight;
             _displayPixelWidth = gifSource.PixelWidth;
         }
 
@@ -910,59 +1013,37 @@ private async Task LoadGifAsync(string path, int generation, CancellationToken t
         // отмена при листании - штатный сценарий
         AppLog.Debug("PhotoView.LoadGif отменено");
     }
-    catch (GifAnimator.GifUnsupportedException ex)
+    catch (GifUnsupportedException ex)
     {
-        // Файл назван .gif, но внутри другой формат (WebP/PNG/JPEG/MP4...) либо GIF оборван
-        // или повреждён. Это не ошибка приложения, поэтому Warn, а не Error
-        AppLog.Warn("PhotoView.LoadGif", ex,
-            $"{AppLog.Describe(path)}, actual: {ex.ActualFormat}");
+        // Внутри файла не GIF (WebP, PNG, MP4 под чужим именем) либо GIF повреждён.
+        // Это не сбой приложения: показываем файл обычной картинкой, как любое другое фото.
+        AppLog.Warn("PhotoView.LoadGif: не анимация", ex, AppLog.Describe(path));
         if (token.IsCancellationRequested || generation != _showGeneration) return;
 
-        // Видео, архив, SVG и т.п. показать нечем, а DecodeFullImage читает файл целиком
-        // в память: на многогигабайтном видео это хуже самой ошибки. Отсекаем сразу
-        if (!ImageFormatSniffer.CanTryStaticImage(ex.ActualFormat))
+        if (ImageFormatSniffer.CanTryStaticImage(ex.ActualFormat, _currentFileSizeBytes))
         {
-            ShowOpenError(path, ex, ex.ActualFormat);
+            await LoadImageAsync(path, generation, token);
             return;
         }
 
-        // Остальное открываем обычным путём: там уже есть выбор кодека по содержимому,
-        // EXIF-ориентация и уменьшение внутри декодера. Оборванный GIF покажется первым кадром
-        await LoadImageAsync(path, generation, token, ex.ActualFormat);
+        // Видео или архив под именем .gif: показывать нечем, объясняем причину
+        ShowOpenError(path, ex);
     }
     catch (Exception ex)
     {
-        // Отдельное имя операции: сбой аниматора не должен быть неотличим от сбоя обычного показа
         AppLog.Error("PhotoView.LoadGif", ex, AppLog.Describe(path));
         if (generation != _showGeneration) return;
         ShowOpenError(path, ex);
     }
 }
 
-private void ShowOpenError(string path, Exception ex, SniffedFormat actualFormat = SniffedFormat.Unknown)
+private void ShowOpenError(string path, Exception ex)
 {
-    string failed = Loc.T("Failed to open", "Не удалось открыть", "No se pudo abrir");
-    string name = Path.GetFileName(path);
+    // Если содержимое не совпадает с расширением, это почти всегда и есть причина:
+    // «испорченный» GIF чаще всего оказывается WebP или MP4 под чужим именем
+    string hint = ImageFormatSniffer.DescribeMismatch(path);
 
-    // Файл выдаёт себя не за тот формат (например, MP4 под именем .gif): говорим, что внутри.
-    // Gif и Unknown сюда не попадают: «на самом деле GIF» ничего не объясняет
-    if (actualFormat != SniffedFormat.Unknown && actualFormat != SniffedFormat.Gif)
-    {
-        string actual = string.Format(
-            Loc.T("it is actually {0}", "на самом деле это {0}", "en realidad es {0}"),
-            ImageFormatSniffer.Describe(actualFormat));
-
-        // Для видео/архива причина исчерпана сама по себе; если же картинку не смог открыть
-        // декодер (например, нет кодека HEIC), его сообщение тоже полезно
-        FileNameDisplay.Text = ex is GifAnimator.GifUnsupportedException
-            ? $"{failed}: {name} — {actual}"
-            : $"{failed}: {name} — {actual} ({ex.Message})";
-    }
-    else
-    {
-        FileNameDisplay.Text = $"{failed}: {name} ({ex.Message})";
-    }
-
+    FileNameDisplay.Text = Loc.T("Failed to open", "Не удалось открыть", "No se pudo abrir") + $": {Path.GetFileName(path)} ({ex.Message}){hint}";
     FileMetaText.Text = "";
 }
 
@@ -982,18 +1063,24 @@ private void MaybeUpgradeToFullResolution(double scale)
     if (MainImage.ActualWidth * scale <= _displayPixelWidth * 1.05) return;
 
     _fullResRequested = true;
-    _ = LoadFullResolutionAsync(_folderFiles[_currentIndex], _showGeneration);
+    // Для 100+ Мп и широких панорам «полный размер» для экрана ограничен стороной
+    // MaxZoomDecodeSide: больше не нужно для резкости и не влезает в текстуру GPU.
+    int side = Math.Max(_currentWidth, _currentHeight) > MaxZoomDecodeSide ? MaxZoomDecodeSide : 0;
+    _ = LoadFullResolutionAsync(_folderFiles[_currentIndex], _showGeneration, side,
+        _imageLoadCts?.Token ?? CancellationToken.None);
 }
 
-private async Task LoadFullResolutionAsync(string path, int generation)
+/// <summary>Потолок стороны при приближении (типичный предел текстуры Direct3D 11).</summary>
+private const int MaxZoomDecodeSide = 16384;
+
+private async Task LoadFullResolutionAsync(string path, int generation, int side, CancellationToken token)
 {
     try
     {
-        var decoded = await Task.Run(() => DecodeFullImage(path, 0));
-        if (generation != _showGeneration) return;
+        var decoded = await ImageLoads.RequestAsync(path, side, foreground: true, token);
+        if (token.IsCancellationRequested || generation != _showGeneration) return;
 
-        MainImage.Source = decoded.Image;
-        _displayPixelWidth = decoded.Image.PixelWidth;
+        ApplyDecodedImage(decoded, path);
     }
     catch (Exception ex)
     {
@@ -1009,9 +1096,11 @@ private void RefreshFileLabels(string path)
     double sizeMb = _currentFileSizeBytes / (1024.0 * 1024.0);
     string sizeText = $"{sizeMb:0.00} MB";
 
+    // Пока список папки собирается в фоне, общее число ещё неизвестно
+    string position = _folderListLoading ? $"[{_currentIndex + 1}/\u2026]" : $"[{_currentIndex + 1}/{_folderFiles.Count}]";
     FileMetaText.Text = _currentWidth > 0
-        ? $"({_currentWidth}\u00d7{_currentHeight}, {sizeText})   [{_currentIndex + 1}/{_folderFiles.Count}]"
-        : $"({sizeText})   [{_currentIndex + 1}/{_folderFiles.Count}]";
+        ? $"({_currentWidth}\u00d7{_currentHeight}, {sizeText})   {position}"
+        : $"({sizeText})   {position}";
 }
 
         // --- Навигация ---
@@ -1024,7 +1113,9 @@ private void ShowNext() => NavigateSkippingMissing(forward: true);
 
 private void NavigateSkippingMissing(bool forward)
 {
+    if (_fileOperation != null) return;
     if (_folderFiles.Count == 0) return;
+    _lastNavigationForward = forward;
 
     int guard = _folderFiles.Count; // предохранитель от бесконечного цикла
 
@@ -1054,6 +1145,7 @@ private void NavigateSkippingMissing(bool forward)
 
 private void GoToFirst()
 {
+    if (_fileOperation != null) return;
     if (_folderFiles.Count == 0) return;
     _currentIndex = -1; // следующий кандидат при поиске вперёд - индекс 0
     NavigateSkippingMissing(forward: true);
@@ -1061,17 +1153,50 @@ private void GoToFirst()
 
 private void GoToLast()
 {
+    if (_fileOperation != null) return;
     if (_folderFiles.Count == 0) return;
     _currentIndex = 0; // предыдущий кандидат при поиске назад - последний индекс
     NavigateSkippingMissing(forward: false);
 }
 
-private void ShowNoAccessibleFilesState()
+// Любой переход к пустому экрану инвалидирует ВСЕ результаты старого поколения.
+private void ResetCurrentImageState()
 {
-    _currentIndex = -1;
+    ++_showGeneration;
+    _viewRotationDegrees = 0; _viewRotationPath = null; _viewBase = null;
+    RefreshRotationUi();
+    CancelPrefetch();
+    _imageLoadCts?.Cancel();
+    _imageLoadCts?.Dispose();
+    _imageLoadCts = null;
+    _ocrCts?.Cancel();
+    _ocrCts = null; // источник OCR освобождает владеющая им операция в finally
+    _thumbnailLoadCts?.Cancel();
+    _visibleThumbnailCts?.Cancel();
+    CloseThumbnailGrid();
     _gifAnimator?.Stop();
     _gifAnimator = null;
+    ExitCropMode();
+    ResetTransform();
+    _isPanning = false;
+    _isDragCandidate = false;
+    MainImage.ReleaseMouseCapture();
+    MainImage.Cursor = Cursors.Arrow;
     MainImage.Source = null;
+    _currentWidth = _currentHeight = _displayPixelWidth = 0;
+    _currentFileSizeBytes = 0;
+    _fullResRequested = false;
+    _currentIndex = -1;
+    OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+    OcrButton.IsEnabled = true;
+    GifPlayPauseButton.Visibility = Visibility.Collapsed;
+    ConvertToJpgButton.Visibility = Visibility.Collapsed;
+    RefreshRotationUi();
+}
+
+private void ShowNoAccessibleFilesState()
+{
+    ResetCurrentImageState();
     FileNameDisplay.Text = Loc.T("No accessible files in this folder", "В этой папке нет доступных файлов", "No hay archivos accesibles en esta carpeta");
     FileMetaText.Text = "";
     GifPlayPauseButton.Visibility = Visibility.Collapsed;
@@ -1080,6 +1205,13 @@ private void ShowNoAccessibleFilesState()
 
         private void PhotoView_PreviewKeyDown(object sender, KeyEventArgs e)
 {
+    if (_fileOperation != null && e.Key != Key.F11 && e.Key != Key.Space)
+    {
+        if (e.Key == Key.Escape) CancelOperationButton_Click(sender, e);
+        e.Handled = true;
+        return;
+    }
+
 
 if (FileNameEditBox.Visibility == Visibility.Visible)
     {
@@ -1095,7 +1227,8 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
         }
         else if (e.Key == Key.Enter)
         {
-            ApplyCrop();
+            // Автоповтор зажатого Enter не должен сразу «нажимать» и окно сохранения.
+            if (!e.IsRepeat) ApplyCrop();
             e.Handled = true;
         }
         else if (e.Key is Key.Left or Key.Right or Key.Up or Key.Down or Key.Tab or Key.Space or Key.F11)
@@ -1129,7 +1262,8 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
             e.Handled = true;
             break;
         case Key.Delete:
-            DeleteCurrentFile();
+            // Зажатый Delete раньше через автоповтор удалял фото одно за другим.
+            if (!e.IsRepeat) DeleteCurrentFile();
             e.Handled = true;
             break;
         case Key.C when (Keyboard.Modifiers & ModifierKeys.Control) != 0:
@@ -1381,13 +1515,16 @@ private void StartImageDrag()
 
         private async void OcrButton_Click(object sender, RoutedEventArgs e)
         {
+    if (_fileOperation != null || _viewRotationDegrees != 0) return;
             if (_currentIndex < 0) return;
             var path = _folderFiles[_currentIndex];
 
             // Повторное нажатие или переход к другому фото отменяют прошлый запуск
             _ocrCts?.Cancel();
-            _ocrCts = new CancellationTokenSource();
-            var ocrToken = _ocrCts.Token;
+            var ocrCts = new CancellationTokenSource();
+            _ocrCts = ocrCts;
+            var ocrToken = ocrCts.Token;
+            int ocrGeneration = _showGeneration;
 
             OcrButton.IsEnabled = false;
             OcrButton.Content = Loc.T("Scanning...", "Распознавание...", "Reconociendo...");
@@ -1416,6 +1553,7 @@ private void StartImageDrag()
                     ocrError = ocrEx.Message;
                 }
 
+                if (ocrToken.IsCancellationRequested || ocrGeneration != _showGeneration) return;
                 if (ocrError != null)
                 {
                     MessageBox.Show(Loc.T("Local text recognition is unavailable", "Локальное распознавание недоступно", "El reconocimiento local no está disponible")
@@ -1425,92 +1563,456 @@ private void StartImageDrag()
                 }
 
                 // Окно открываем всегда: даже если текст не найден, фото можно отправить в Google
+                if (ocrToken.IsCancellationRequested || ocrGeneration != _showGeneration) return;
                 var window = new OcrResultWindow(found, path) { Owner = Window.GetWindow(this) };
                 window.ShowDialog();
             }
             catch (Exception ex)
             {
                 AppLog.Error("PhotoView.OcrButton_Click", ex);
+                if (ocrToken.IsCancellationRequested || ocrGeneration != _showGeneration) return;
                 MessageBox.Show(Loc.T("Text recognition failed", "Не удалось распознать текст", "Error en el reconocimiento de texto") + $": {ex.Message}",
                     "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             finally
             {
-                OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
-                OcrButton.IsEnabled = true;
+                if (ReferenceEquals(_ocrCts, ocrCts))
+                {
+                    _ocrCts = null;
+                    OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+                    OcrButton.IsEnabled = true;
+                }
+                ocrCts.Dispose();
             }
+        }
+
+        private FileOperationContext? _fileOperation;
+        private Window? _operationOwner;
+        private bool _closeAfterOperation;
+        private string _operationTitle = "";
+
+        private async Task RunFileOperationAsync(string title, Func<FileOperationContext, Task> body)
+        {
+            if (_fileOperation != null) return;
+            var operation = new FileOperationContext();
+            _fileOperation = operation;
+            _operationOwner = Window.GetWindow(this);
+            _operationTitle = title;
+            _closeAfterOperation = false;
+            ++_showGeneration;
+            InvalidateOperationCaches();
+            _imageLoadCts?.Cancel();
+            _ocrCts?.Cancel();
+            _ocrCts = null;
+            OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+            _thumbnailLoadCts?.Cancel();
+            OperationStatusPanel.Visibility = Visibility.Visible;
+            UpdateOperationControls();
+            UpdateOperationStatus();
+            var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            timer.Tick += (_, _) => UpdateOperationStatus();
+            timer.Start();
+            try { await body(operation); }
+            catch (OperationCanceledException)
+            {
+                AppLog.Debug("PhotoView.FileOperation.Cancelled");
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("PhotoView.FileOperation", ex);
+                if (!_closeAfterOperation)
+                    MessageBox.Show(_operationOwner, title + ": " + ex.Message, "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                timer.Stop();
+                _fileOperation = null;
+                operation.Dispose();
+                OperationStatusPanel.Visibility = Visibility.Collapsed;
+                UpdateOperationControls();
+                InvalidateOperationCaches();
+                if (_closeAfterOperation) _operationOwner?.Close();
+                else if (_currentIndex >= 0 && _currentIndex < _folderFiles.Count) ShowCurrent();
+                else if (_folderFiles.Count == 0) ShowNoAccessibleFilesState();
+                _operationOwner = null;
+            }
+        }
+
+        private void InvalidateOperationCaches()
+        {
+            CancelPrefetch(); ImageLoads.Invalidate();
+        }
+
+        private void UpdateOperationControls()
+        {
+            SetCropModeUi(_isCropMode);
+            bool available = _fileOperation == null;
+            CropButton.IsEnabled = available;
+            OcrButton.IsEnabled = available;
+            CropSaveButton.IsEnabled = available;
+            CropCancelButton.IsEnabled = available;
+            CropOverlay.IsHitTestVisible = available;
+            FileNameDisplay.IsHitTestVisible = available;
+            if (!available)
+            {
+                foreach (var control in new Control[] { OpenButton, PrevButton, NextButton, RotateButton,
+                    ConvertToJpgButton, StripExifButton, BatchRenameButton, DeleteButton, GridViewButton,
+                    SortModeCombo, SortDirectionButton, FileNameEditBox }) control.IsEnabled = false;
+            }
+            else { PrevButton.IsEnabled = NextButton.IsEnabled = FileNameEditBox.IsEnabled = true; }
+            RefreshRotationUi();
+        }
+
+        private void UpdateOperationStatus()
+        {
+            if (_fileOperation == null) return;
+            var progress = _fileOperation.Progress;
+            string stage = progress.Stage switch
+            {
+                FileOperationStage.Decoding => Loc.T("Reading image", "Чтение изображения", "Leyendo imagen"),
+                FileOperationStage.Encoding => Loc.T("Encoding", "Кодирование", "Codificando"),
+                FileOperationStage.Writing => Loc.T("Writing / encoding", "Запись / кодирование", "Escribiendo / codificando"),
+                FileOperationStage.Committing => Loc.T("Finishing file — cannot cancel", "Завершение записи — отмена недоступна", "Finalizando archivo — no se puede cancelar"),
+                FileOperationStage.Planning => Loc.T("Scanning / planning", "Обход папок / подготовка плана", "Explorando / planificando"),
+                FileOperationStage.Renaming => Loc.T("Renaming", "Переименование", "Renombrando"),
+                FileOperationStage.Refreshing => Loc.T("Refreshing", "Обновление списка", "Actualizando"),
+                _ => Loc.T("Preparing", "Подготовка", "Preparando")
+            };
+            if (_fileOperation.Token.IsCancellationRequested)
+                stage = Loc.T("Cancellation requested — waiting for a safe boundary",
+                    "Отмена запрошена — ожидание безопасной границы", "Cancelación solicitada — esperando un punto seguro");
+            if (_closeAfterOperation)
+                stage = Loc.T("Finishing before closing: ", "Завершение перед выходом: ", "Finalizando antes de cerrar: ") + stage;
+            OperationStatusText.Text = _operationTitle + " — " + stage +
+                (progress.Total > 0 ? $" ({progress.Processed}/{progress.Total})" : "");
+            CancelOperationButton.Content = Loc.T("Cancel", "Отменить", "Cancelar");
+            CancelOperationButton.IsEnabled = progress.CanCancel && !_fileOperation.Token.IsCancellationRequested;
+        }
+        private void CancelOperationButton_Click(object sender, RoutedEventArgs e)
+        {
+            _fileOperation?.Cancel();
+            UpdateOperationStatus();
+        }
+        private void OperationWindowClosing(object? sender, CancelEventArgs e)
+        {
+            if (_fileOperation == null)
+            {
+                ++_showGeneration; _imageLoadCts?.Cancel(); _ocrCts?.Cancel();
+                _thumbnailLoadCts?.Cancel(); CancelPrefetch(); ImageLoads.Invalidate();
+                return;
+            }
+            e.Cancel = true;
+            _closeAfterOperation = true;
+            _fileOperation.Cancel();
+            UpdateOperationStatus();
         }
 
         // --- Поворот ---
 
         private void RotateButton_Click(object sender, RoutedEventArgs e) => RotateCurrent();
 
+        private int _viewRotationDegrees;
+        private string? _viewRotationPath;
+        private DecodedImage? _viewBase;
+        private BitmapSource WithViewRotation(BitmapSource image)
+        {
+            if (_viewRotationDegrees == 0) return image;
+            var result = new TransformedBitmap(image, new RotateTransform(_viewRotationDegrees));
+            if (result.CanFreeze) result.Freeze();
+            return result;
+        }
+        private void RefreshRotationUi()
+        {
+            SaveRotationButton.Content = Loc.T("Save rotation", "Сохранить поворот", "Guardar giro");
+            RestoreOriginalButton.Content = Loc.T("Restore original", "Вернуть оригинал", "Restaurar original");
+            bool idle = _fileOperation == null && !_isCropMode;
+            SaveRotationButton.Visibility = _viewRotationDegrees != 0 ? Visibility.Visible : Visibility.Collapsed;
+            SaveRotationButton.IsEnabled = idle;
+            string? path = _currentIndex >= 0 && _currentIndex < _folderFiles.Count ? _folderFiles[_currentIndex] : null;
+            DiscardBackupButton.Content = Loc.T("Delete backup", "Удалить резервную копию", "Eliminar copia");
+            DiscardBackupButton.ToolTip = Loc.T("Keep the changes and move the backup of the original to the Recycle Bin",
+                "Оставить изменения, а копию оригинала переместить в корзину", "Conservar los cambios y mover la copia del original a la papelera");
+            bool hasBackup = path != null && ImageSaveWriter.HasBackup(path);
+            RestoreOriginalButton.Visibility = hasBackup ? Visibility.Visible : Visibility.Collapsed;
+            RestoreOriginalButton.IsEnabled = idle;
+            DiscardBackupButton.Visibility = RestoreOriginalButton.Visibility;
+            DiscardBackupButton.IsEnabled = idle;
+            RotationActionsPanel.Visibility = SaveRotationButton.Visibility == Visibility.Visible || hasBackup ? Visibility.Visible : Visibility.Collapsed;
+            if (_viewRotationDegrees != 0) { CropButton.IsEnabled = false; OcrButton.IsEnabled = false; StripExifButton.IsEnabled = false; }
+        }
         private void RotateCurrent()
         {
-            if (_currentIndex < 0) return;
-            var path = _folderFiles[_currentIndex];
+            if (_fileOperation != null || _isCropMode || _currentIndex < 0 || _viewBase == null || _gifAnimator != null) return;
+            _viewRotationDegrees = (_viewRotationDegrees + 90) % 360;
+            ApplyDecodedImage(_viewBase, _folderFiles[_currentIndex]);
+            ResetTransform();
+            UpdateOperationControls();
+        }
+        private void SaveRotationButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_fileOperation != null || _currentIndex < 0 || _viewRotationDegrees == 0) return;
+            string path = _folderFiles[_currentIndex]; int degrees = _viewRotationDegrees;
+            var options = new ImageSaveOptionsWindow(Window.GetWindow(this), path, strip: false);
+            if (options.ShowDialog() != true) return;
+            bool saveCopy = options.Copy, reencode = options.Reencode;
+            _ = RunFileOperationAsync(Loc.T("Save rotation", "Сохранение поворота", "Guardar giro"), async operation =>
+            {
+                string saved = await BackgroundFileWorker.Run(() => RotateAndSaveService.SaveRotation(path, degrees, saveCopy, reencode, operation));
+                CompleteImageSave(saved);
+            });
+        }
+        private void CompleteImageSave(string saved)
+        {
+            _viewRotationDegrees = 0; _viewRotationPath = saved; _viewBase = null;
+            if (!_folderFiles.Contains(saved, StringComparer.OrdinalIgnoreCase)) _folderFiles.Add(saved);
+            _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, saved, StringComparison.OrdinalIgnoreCase));
+        }
+        private void RestoreOriginalButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_fileOperation != null || _currentIndex < 0) return;
+            string path = _folderFiles[_currentIndex];
+            if (MessageBox.Show(Window.GetWindow(this), Loc.T(
+                    "Restore the exact original from the backup next to the photo? Unsaved view rotation is discarded. If the file was changed by another program after editing, automatic restore is refused.\n\nAfterwards the backups that are no longer needed (and the undone edit) are moved to the Recycle Bin.",
+                    "Вернуть точные байты оригинала из резервной копии рядом с фото? Несохранённый поворот будет сброшен. Если после правки файл изменила другая программа, автоматическое восстановление отклоняется.\n\nПосле этого ненужные резервные копии (и отменённая правка) перемещаются в корзину.",
+                    "¿Restaurar el original exacto desde la copia junto a la foto? Se descarta el giro no guardado. Si otro programa cambió el archivo, se rechaza.\n\nDespués, las copias innecesarias (y la edición deshecha) van a la papelera."),
+                    "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+            _ = RunFileOperationAsync(Loc.T("Restore original", "Восстановление оригинала", "Restaurar original"), async operation =>
+            {
+                var result = await BackgroundFileWorker.Run(() => ImageSaveWriter.Restore(path, operation));
+                operation.Finalizing(FileOperationStage.Refreshing);
+                CompleteImageSave(path);
+                int left = RecycleBackups(result.RedundantBackups);
+                if (left > 0)
+                    MessageBox.Show(_operationOwner, Loc.T(
+                        $"The original is back. {left} backup file(s) could not be moved to the Recycle Bin and remain next to the photo.",
+                        $"Оригинал возвращён. Резервные копии ({left}) не удалось переместить в корзину — они остались рядом с фото.",
+                        $"El original está restaurado. {left} copia(s) no se pudieron mover a la papelera."),
+                        "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
+            });
+        }
 
+        /// <summary>Резервные копии — в корзину (не безвозвратно). Возвращает, сколько осталось на месте.</summary>
+        private int RecycleBackups(IEnumerable<string> backups)
+        {
+            var owner = _operationOwner ?? Window.GetWindow(this);
+            IntPtr hwnd = owner != null ? new System.Windows.Interop.WindowInteropHelper(owner).Handle : IntPtr.Zero;
+            var removed = new List<string>(); int left = 0;
+            foreach (var backup in backups)
+            {
+                try
+                {
+                    if (!File.Exists(backup) || RecycleBinService.Recycle(backup, hwnd) == RecycleResult.Removed) removed.Add(backup);
+                    else left++;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+                {
+                    AppLog.Warn("PhotoView.RecycleBackup", ex, AppLog.Describe(backup));
+                    left++;
+                }
+            }
+            ImageSaveWriter.ForgetBackups(removed);
+            return left;
+        }
+
+        private void DiscardBackupButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_fileOperation != null || _currentIndex < 0) return;
+            string path = _folderFiles[_currentIndex];
+            var owner = Window.GetWindow(this);
+            List<ImageSaveWriter.DiskBackup> mine, all;
             try
             {
-                RotateAndSaveService.RotateAndSave(path, 90);
-                ShowCurrent();
+                mine = ImageSaveWriter.FindBackups(path);
+                all = ImageSaveWriter.FindFolderBackups(Path.GetDirectoryName(path)!);
             }
-            catch (NotSupportedException ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                AppLog.Info("PhotoView.RotateCurrent", ex);
-                MessageBox.Show(
-                    Loc.T("Rotation saving isn't supported for this file format.", "Сохранение поворота не поддерживается для этого формата файла.", "Guardar el giro no es compatible con este formato de archivo."),
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(owner, ex.Message, "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            if (mine.Count == 0)
+            {
+                ImageSaveWriter.IndexFolder(Path.GetDirectoryName(path)!);
+                UpdateOperationControls();
+                return;
+            }
+            if (MessageBox.Show(owner, Loc.T(
+                    $"Keep the changes and move the backup of the original ({mine.Count} file(s)) to the Recycle Bin?\n\n\"Restore original\" will no longer be available for this photo.",
+                    $"Оставить изменения, а резервную копию оригинала ({mine.Count} файл(ов)) переместить в корзину?\n\n«Вернуть оригинал» для этого фото станет недоступна.",
+                    $"¿Conservar los cambios y mover la copia del original ({mine.Count} archivo(s)) a la papelera?\n\n«Restaurar original» dejará de estar disponible."),
+                    "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+            var targets = mine.Select(b => b.Path).ToList();
+            int others = all.Count - mine.Count;
+            if (others > 0 && MessageBox.Show(owner, Loc.T(
+                    $"This folder has {others} more backup file(s) of other photos. Move them to the Recycle Bin too?",
+                    $"В этой папке есть ещё резервные копии других фото: {others}. Переместить в корзину и их?",
+                    $"Esta carpeta tiene {others} copia(s) más de otras fotos. ¿Moverlas también a la papelera?"),
+                    "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes)
+                targets = all.Select(b => b.Path).ToList();
+            int left = RecycleBackups(targets);
+            UpdateOperationControls();
+            if (left > 0)
+                MessageBox.Show(owner, Loc.T($"{left} backup file(s) could not be moved to the Recycle Bin.",
+                    $"Не удалось переместить в корзину резервных копий: {left}.", $"No se pudieron mover {left} copia(s)."),
+                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+
+        private void ConvertToJpgButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_fileOperation != null || _currentIndex < 0) return;
+            string path = _folderFiles[_currentIndex];
+            var owner = Window.GetWindow(this);
+            const string caption = "PhotoMusicViewer";
+
+            WebpInfo info;
+            FileVersion inspectedVersion;
+            try
+            {
+                inspectedVersion = FileVersion.Read(path);
+                info = ConvertWebpToJpgService.Inspect(path);
+                if (FileVersion.Read(path) != inspectedVersion)
+                    throw new IOException(Loc.T("The WebP changed during inspection. Open it again.",
+                        "WebP изменился во время проверки. Откройте его заново.",
+                        "El WebP cambió durante la inspección. Ábralo de nuevo."));
             }
             catch (Exception ex)
             {
-                AppLog.Error("PhotoView.RotateCurrent", ex);
-                MessageBox.Show(Loc.T("Rotation failed", "Не удалось повернуть", "Error al girar") + $": {ex.Message}",
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
+                AppLog.Warn("PhotoView.InspectWebp", ex, AppLog.Describe(path));
+                MessageBox.Show(owner, Loc.T("Convert to JPG", "Конвертация в JPG", "Convertir a JPG") + ": " + ex.Message,
+                    caption, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
             }
+
+            // Анимация в JPG/PNG не переносится: только по явному согласию и только копией
+            if (info.IsAnimated)
+            {
+                string frames = info.AnimationFrames > 1 ? $" ({info.AnimationFrames})" : "";
+                var answer = MessageBox.Show(owner,
+                    Loc.T($"This WebP is animated{frames}. JPG and PNG keep only the first frame, so the animation would be lost.\n\nSave the first frame as a separate file? The original WebP stays untouched.",
+                          $"Этот WebP анимированный{frames}. В JPG и PNG сохранится только первый кадр — анимация будет потеряна.\n\nСохранить первый кадр отдельным файлом? Исходный WebP останется нетронутым.",
+                          $"Este WebP es animado{frames}. JPG y PNG solo conservan el primer fotograma: la animación se perdería.\n\n¿Guardar el primer fotograma como archivo aparte? El WebP original no se modifica."),
+                    caption, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+                if (answer != MessageBoxResult.Yes) return;
+            }
+
+            // JPG не умеет прозрачность: предлагаем PNG (по умолчанию) или белый фон
+            var target = WebpConvertTarget.Jpg;
+            if (info.MayHaveAlpha)
+            {
+                var answer = MessageBox.Show(owner,
+                    Loc.T("This WebP may contain transparency, which JPG cannot store.\n\nYes — save as PNG (keeps transparency)\nNo — save as JPG on a white background\nCancel — do nothing",
+                          "В этом WebP может быть прозрачность, а JPG её не поддерживает.\n\nДа — сохранить как PNG (прозрачность сохранится)\nНет — сохранить как JPG на белом фоне\nОтмена — ничего не делать",
+                          "Este WebP puede tener transparencia, y JPG no la admite.\n\nSí — guardar como PNG (conserva la transparencia)\nNo — guardar como JPG con fondo blanco\nCancelar — no hacer nada"),
+                    caption, MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Yes);
+                if (answer == MessageBoxResult.Cancel || answer == MessageBoxResult.None) return;
+                target = answer == MessageBoxResult.Yes ? WebpConvertTarget.Png : WebpConvertTarget.Jpg;
+            }
+
+            bool offerRemoveOriginal = !info.IsAnimated;
+            var mode = _sortMode; bool descending = _sortDescending;
+            _ = RunFileOperationAsync(Loc.T("Convert to JPG", "Конвертация в JPG", "Convertir a JPG"), async operation =>
+            {
+                var converted = await BackgroundFileWorker.Run(() =>
+                {
+                    operation.Checkpoint(FileOperationStage.Decoding);
+                    var snapshot = SourceFileSnapshot.Capture(path, operation.Token);
+                    if (snapshot.Version != inspectedVersion)
+                        throw new IOException(Loc.T("The WebP changed. Open it again before converting.",
+                            "WebP изменился. Откройте его заново перед конвертацией.",
+                            "El WebP cambió. Ábralo de nuevo antes de convertir."));
+                    string result = ConvertWebpToJpgService.ConvertVerified(path, target, snapshot, operation);
+                    return (Saved: result, Snapshot: snapshot);
+                });
+                string saved = converted.Saved;
+                operation.Finalizing(FileOperationStage.Refreshing);
+
+                // Сначала фиксируем завершённое сохранение: новый файл появляется рядом с исходником.
+                var files = _folderFiles.ToList();
+                if (!files.Contains(saved, StringComparer.OrdinalIgnoreCase)) files.Add(saved);
+                _folderFiles = files;
+                _currentIndex = files.FindIndex(f => string.Equals(f, saved, StringComparison.OrdinalIgnoreCase));
+
+                // Исходник удаляется только по явному «Да» (по умолчанию — «Нет»),
+                // и только через окна Windows, которые спросят о безвозвратном удалении.
+                if (offerRemoveOriginal && !_closeAfterOperation)
+                {
+                    bool unchanged = await BackgroundFileWorker.Run(() => converted.Snapshot.Matches(path));
+                    if (!unchanged)
+                        MessageBox.Show(_operationOwner, Loc.T(
+                            "The original WebP changed or is unavailable. It will not be deleted.",
+                            "Исходный WebP изменился или недоступен. Он не будет удалён.",
+                            "El WebP original cambió o no está disponible. No se eliminará."),
+                            caption, MessageBoxButton.OK, MessageBoxImage.Information);
+                    var answer = !unchanged ? MessageBoxResult.No : MessageBox.Show(_operationOwner,
+                        Loc.T($"Saved: {Path.GetFileName(saved)}\n\nMove the original WebP to the Recycle Bin?",
+                              $"Сохранено: {Path.GetFileName(saved)}\n\nПереместить исходный WebP в корзину?",
+                              $"Guardado: {Path.GetFileName(saved)}\n\n¿Mover el WebP original a la papelera?"),
+                        caption, MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
+                    if (answer == MessageBoxResult.Yes)
+                    {
+                        IntPtr hwnd = _operationOwner != null
+                            ? new System.Windows.Interop.WindowInteropHelper(_operationOwner).Handle : IntPtr.Zero;
+                        // Повторная проверка ПОСЛЕ диалога. Shell получает только отдельно
+                        // изолированный и проверенный файл, а не исходный путь синхронизации.
+                        var removed = await BackgroundFileWorker.Run(() => VerifiedSourceRemoval.Recycle(
+                            path, converted.Snapshot, staged => RecycleBinService.TryDeleteWithConfirmation(staged, hwnd)));
+                        if (removed == SourceRemovalResult.Removed && !File.Exists(path))
+                            files.RemoveAll(f => string.Equals(f, path, StringComparison.OrdinalIgnoreCase));
+                        else if (removed == SourceRemovalResult.SourceChanged)
+                            MessageBox.Show(_operationOwner, Loc.T(
+                                "The original changed while confirmation was open. It was not deleted.",
+                                "Исходник изменился, пока было открыто подтверждение. Он не удалён.",
+                                "El original cambió durante la confirmación. No se eliminó."),
+                                caption, MessageBoxButton.OK, MessageBoxImage.Information);
+                        else if (File.Exists(path))
+                            MessageBox.Show(_operationOwner,
+                                Loc.T("The original WebP was kept.", "Исходный WebP оставлен на месте.", "Se conservó el WebP original."),
+                                caption, MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
+                }
+
+                _folderFiles = await Task.Run(() => SortFileSnapshot(files, mode, descending));
+                _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, saved, StringComparison.OrdinalIgnoreCase));
+            });
         }
 
-        // --- WebP → JPG ---
-
-        private void ConvertToJpgButton_Click(object sender, RoutedEventArgs e)
-{
-    if (_currentIndex < 0) return;
-    var path = _folderFiles[_currentIndex];
-
-    try
-    {
-        var newPath = ConvertWebpToJpgService.ConvertToJpg(path);
-        _folderFiles[_currentIndex] = newPath;
-        ReapplySort();
-        ShowCurrent();
-    }
-    catch (Exception ex)
-    {
-        AppLog.Error("PhotoView.ConvertToJpg", ex);
-        MessageBox.Show(Loc.T("Conversion failed", "Не удалось конвертировать", "Error de conversión") + $": {ex.Message}",
-            "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
-    }
-}
     private void DeleteButton_Click(object sender, RoutedEventArgs e) => DeleteCurrentFile();
 
 private void DeleteCurrentFile()
 {
+    if (_fileOperation != null) return;
     if (_currentIndex < 0) return;
     var path = _folderFiles[_currentIndex];
+    var owner = Window.GetWindow(this);
+
+    // Подтверждение (по умолчанию включено, отключается в настройках). Если корзина для
+    // этого файла недоступна, Windows дополнительно спросит про безвозвратное удаление.
+    if (AppPreferences.Current.ConfirmDelete &&
+        MessageBox.Show(owner,
+            Loc.T($"Move \"{Path.GetFileName(path)}\" to the Recycle Bin?",
+                  $"Переместить «{Path.GetFileName(path)}» в корзину?",
+                  $"¿Mover «{Path.GetFileName(path)}» a la papelera?") + "\n\n" +
+            Loc.T("If this drive has no Recycle Bin (USB stick, network drive) or the file is too large, Windows will ask before deleting it permanently.",
+                  "Если на этом диске нет корзины (флешка, сетевой диск) или файл слишком большой, Windows спросит перед безвозвратным удалением.",
+                  "Si esta unidad no tiene papelera (USB, red) o el archivo es demasiado grande, Windows preguntará antes de borrarlo definitivamente."),
+            Loc.T("Delete", "Удаление", "Eliminar"), MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.Yes) != MessageBoxResult.Yes)
+        return;
 
     try
     {
-        Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
-            path,
-            Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-            Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+        IntPtr hwnd = owner != null ? new System.Windows.Interop.WindowInteropHelper(owner).Handle : IntPtr.Zero;
+        if (RecycleBinService.Recycle(path, hwnd) == RecycleResult.Declined) return; // отказ в окне Windows — файл на месте
     }
-    catch (Exception ex)
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
     {
-        // Удаление не удалось (например, файл занят другим процессом) —
-        // окно не показываем, но причина теперь видна в журнале
+        // Раньше ошибка попадала только в журнал (по умолчанию выключенный): файл
+        // оставался на месте, а пользователь думал, что удалил его.
         AppLog.Warn("PhotoView.DeleteCurrentFile", ex, AppLog.Describe(path));
-        return;
+        if (ex is not RecycleException { ReportedByWindows: true } and not FileNotFoundException)
+            MessageBox.Show(owner, Loc.T("The file was not deleted: ", "Файл не удалён: ", "No se eliminó el archivo: ") + ex.Message,
+                "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Warning);
+        if (ex is not FileNotFoundException) return; // файл на месте
+        // Файла уже нет — просто убираем его из списка, как после удаления.
     }
 
     int removedIndex = _currentIndex;
@@ -1518,10 +2020,7 @@ private void DeleteCurrentFile()
 
     if (_folderFiles.Count == 0)
     {
-        _currentIndex = -1;
-        _gifAnimator?.Stop();
-        _gifAnimator = null;
-        MainImage.Source = null;
+        ResetCurrentImageState();
         FileNameDisplay.Text = Loc.T("No file opened", "Файл не открыт", "Ningún archivo abierto");
         FileMetaText.Text = "";
         GifPlayPauseButton.Visibility = Visibility.Collapsed;
@@ -1554,6 +2053,7 @@ private static string GetAvailablePath(string path)
 
 private void FileNameDisplay_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
 {
+    if (_fileOperation != null) return;
     if (_isCropMode) return;
     if (_currentIndex < 0) return;
 
@@ -1623,6 +2123,7 @@ private async Task CopyCurrentImageToClipboardAsync()
     if (_clipboardCopyInProgress) return;
     if (MainImage.Source is not BitmapSource bitmapSource) return;
 
+    int copyGeneration = _showGeneration;
     _clipboardCopyInProgress = true;
     try
     {
@@ -1635,40 +2136,32 @@ private async Task CopyCurrentImageToClipboardAsync()
             var path = _folderFiles[_currentIndex];
             try
             {
-                var fullSize = await Task.Run(() =>
-                {
-                    var image = DecodeFullImage(path, 0).Image;
-                    // Передать BitmapSource в UI-поток можно только замороженным
-                    if (image.CanFreeze) image.Freeze();
-                    return image;
-                });
+                var fullSize = (await ImageLoads.RequestAsync(path, 0, foreground: true,
+                    _imageLoadCts?.Token ?? CancellationToken.None)).Image;
 
                 // Пока шло декодирование, пользователь мог пролистать дальше
                 if (_currentIndex >= 0 && _currentIndex < _folderFiles.Count &&
                     string.Equals(_folderFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase))
-                    bitmapSource = fullSize;
+                    bitmapSource = WithViewRotation(fullSize);
             }
             catch (Exception ex) { AppLog.Warn("PhotoView.ClipboardFullDecode", ex); /* кладём то, что уже показано */ }
         }
 
-        // Картинка кладётся в буфер как обычно (Ctrl+V работает везде),
-        // но помечается флагами приватности: Windows не сохранит её
-        // в историю буфера (Win+V) и не отправит в облачную синхронизацию
-        // на другие устройства. Форматы - стандартные имена, которые
-        // понимает сама Windows; значение DWORD 0 = "нельзя".
-        var data = new DataObject();
-        data.SetImage(bitmapSource);
-        data.SetData("CanIncludeInClipboardHistory", new MemoryStream(BitConverter.GetBytes(0)));
-        data.SetData("CanUploadToCloudClipboard", new MemoryStream(BitConverter.GetBytes(0)));
-        data.SetData("ExcludeClipboardContentFromMonitorProcessing", new MemoryStream(BitConverter.GetBytes(0)));
+        // Картинка кладётся в буфер как обычно (Ctrl+V работает везде), с флагами
+        // приватности: без истории буфера (Win+V) и облачной синхронизации.
+        // Как и скопированный текст, она доступна, пока приложение открыто,
+        // и убирается из буфера при выходе (PrivacyClipboard.ClearOwnedContent).
+        if (copyGeneration != _showGeneration) return;
+        var image = bitmapSource;
 
         // Буфер обмена - общий ресурс: пока его держит другое приложение, запись
         // не проходит. Windows советует повторить попытку через короткую паузу.
         for (int attempt = 1; attempt <= 5; attempt++)
         {
+            if (copyGeneration != _showGeneration) return;
             try
             {
-                Clipboard.SetDataObject(data, true);
+                PrivacyClipboard.SetImage(image);
                 return;
             }
             catch (Exception ex) when (attempt < 5)
@@ -1706,6 +2199,7 @@ private void FileNameEditBox_LostFocus(object sender, RoutedEventArgs e)
 
 private void CommitRename()
 {
+    if (_fileOperation != null) return;
     if (FileNameEditBox.Visibility != Visibility.Visible) return; // уже применено/не редактируется - выходим
     if (_currentIndex < 0)
     {
@@ -1768,7 +2262,9 @@ private void CommitRename()
             PhotoModeToggleBtn.Content = Loc.T("Photo", "Фото", "Foto");
             MusicModeToggleBtn.Content = Loc.T("Music", "Музыка", "Música");
             OpenButton.Content = Loc.T("Open", "Открыть", "Abrir");
-            RotateButton.Content = Loc.T("Rotate", "Повернуть", "Girar");
+            RotateButton.Content = Loc.T("Rotate view", "Повернуть вид", "Girar vista");
+            RotateButton.ToolTip = Loc.T("View only — the file is unchanged. Use Save rotation to write a copy.", "Только просмотр — файл не меняется. Для записи используйте «Сохранить поворот».", "Solo vista: archivo sin cambios. Use Guardar giro para crear copia.");
+            RefreshRotationUi();
             CropButton.Content = _isCropMode
                 ? Loc.T("Cancel crop", "Отменить обрезку", "Cancelar recorte")
                 : Loc.T("Crop", "Обрезать", "Recortar");
@@ -1781,7 +2277,7 @@ private void CommitRename()
             ConvertToJpgButton.Content = Loc.T("Convert to JPG", "В JPG", "A JPG");
             GridViewButton.Content = Loc.T("Grid", "Сетка", "Cuadrícula");
             FullscreenButton.Content = Loc.T("Fullscreen", "Во весь экран", "Pantalla completa");
-            TranslateSettingsButton.Content = Loc.T("Translation…", "Перевод…", "Traducción…");
+            TranslateSettingsButton.Content = Loc.T("Settings…", "Настройки…", "Ajustes…");
             CropSaveButton.Content = Loc.T("Save", "Сохранить", "Guardar");
             CropCancelButton.Content = Loc.T("Cancel", "Отмена", "Cancelar");
 
@@ -1824,20 +2320,30 @@ private void CommitRename()
         {
             var dialog = new OpenFileDialog
             {
-                        Filter = "Images|*.jpg;*.jpeg;*.jfif;*.png;*.bmp;*.webp;*.tiff;*.tif;*.gif;*.heic;*.cr2;*.nef;*.arw"
+                        // Фильтр строится из того же списка, что папки и перетаскивание, — не расходятся.
+                        Filter = "Images|" + string.Join(";", SupportedExtensions.Select(ext => "*" + ext))
             };
 
             if (dialog.ShowDialog() == true)
     {
-        PrivacyCleanupService.RemoveFromRecentItems(dialog.FileName);
+        RecentTracesService.Erase(dialog.FileName);
         OpenFile(dialog.FileName);
     }
         }
 
         private void SortModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
 {
-    if (_folderFiles.Count == 0) return;
+    if (_applyingSortPreference) return;
+    if (_fileOperation != null)
+    {
+        // Во время операции порядок не меняется — возвращаем выпадающий список как был.
+        _applyingSortPreference = true;
+        try { SortModeCombo.SelectedIndex = (int)_sortMode; } finally { _applyingSortPreference = false; }
+        return;
+    }
 
+    // Режим запоминается и без открытой папки: раньше выбор на пустом экране
+    // молча терялся, и список показывал не ту сортировку, что применялась.
     _sortMode = SortModeCombo.SelectedIndex switch
     {
         0 => SortMode.Name,
@@ -1846,18 +2352,20 @@ private void CommitRename()
         3 => SortMode.Type,
         _ => SortMode.Name
     };
+    if (_sortUiReady) AppPreferences.RememberPhotoSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-    ReapplySort();
+    if (_folderFiles.Count > 0) ReapplySort();
 }
 
 private void SortDirectionButton_Click(object sender, RoutedEventArgs e)
 {
-    if (_folderFiles.Count == 0) return;
+    if (_fileOperation != null) return;
 
     _sortDescending = !_sortDescending;
     SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+    AppPreferences.RememberPhotoSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-    ReapplySort();
+    if (_folderFiles.Count > 0) ReapplySort();
 }
 
 private void ReapplySort()
@@ -1884,117 +2392,138 @@ private void ReapplySort()
 
         private void BatchRenameButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_currentIndex < 0) return;
-            if (ThumbnailOverlay.Visibility == Visibility.Visible) return;
+            if (_fileOperation != null || _currentIndex < 0 || ThumbnailOverlay.Visibility == Visibility.Visible) return;
             CommitRename();
-
-            var folder = Path.GetDirectoryName(_folderFiles[_currentIndex])!;
-
+            string folder = Path.GetDirectoryName(_folderFiles[_currentIndex])!;
             var dialog = new BatchRenameDialog { Owner = Window.GetWindow(this) };
             if (dialog.ShowDialog() != true) return;
-
-            List<BatchRenamePlanItem> plan;
-            try
+            bool recursive = dialog.Recursive;
+            long start = dialog.StartNumber; int padding = dialog.ZeroPadding;
+            // Корень диска, системные папки и (с подпапками) папки, внутри которых они лежат, — отказ сразу.
+            if (BatchRenameService.ScopeProblem(folder, recursive) is { } scopeProblem)
             {
-                plan = BatchRenameService.BuildPlan(
-                    folder, dialog.Recursive, dialog.StartNumber, dialog.ZeroPadding, SupportedExtensions);
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error("PhotoView.BatchRename prepare", ex);
-                MessageBox.Show(Loc.T("Failed to prepare renaming", "Не удалось подготовить переименование", "No se pudo preparar el renombrado") + $": {ex.Message}",
-                    Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(Window.GetWindow(this), scopeProblem, Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
-
-            if (plan.Count == 0)
+            var mode = _sortMode; bool descending = _sortDescending;
+            // Снимок метаданных текущей папки (на потоке интерфейса): нумерация идёт в том же
+            // порядке, что и просмотр, и сортировка по дате/размеру не перечитывает диск.
+            var metaSnapshot = new Dictionary<string, FolderEntry>(_folderMeta, StringComparer.OrdinalIgnoreCase);
+            string orderText = SortOrderDescription(mode, descending);
+            _ = RunFileOperationAsync(Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), async operation =>
             {
-                MessageBox.Show(Loc.T("Nothing to rename: no photo/GIF files with non-numeric names found.", "Нечего переименовывать: не найдено фото/GIF-файлов с нечисловыми именами.", "Nada que renombrar: no hay fotos/GIF con nombres no numéricos."),
-                    Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            var example = plan[0];
-            var scope = dialog.Recursive ? Loc.T("this folder and its subfolders", "этой папке и её подпапках", "esta carpeta y sus subcarpetas") : Loc.T("this folder", "этой папке", "esta carpeta");
-            var confirm = MessageBox.Show(
-                Loc.T($"Rename {plan.Count} file(s) in {scope}?", $"Переименовать {plan.Count} файл(ов) в {scope}?", $"¿Renombrar {plan.Count} archivo(s) en {scope}?") + "\n\n" +
-                Loc.T("Example", "Пример", "Ejemplo") + $": {Path.GetFileName(example.OldPath)} -> {Path.GetFileName(example.NewPath)}\n\n" +
-                Loc.T("Files whose names are already numbers are skipped.\n", "Файлы, чьи имена уже являются числами, пропускаются.\n", "Los archivos cuyos nombres ya son números se omiten.\n") +
-                Loc.T("Existing files are never overwritten. This can't be undone automatically.", "Существующие файлы никогда не перезаписываются. Отменить это автоматически нельзя.", "Los archivos existentes nunca se sobrescriben. Esto no se puede deshacer automáticamente."),
-                Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (confirm != MessageBoxResult.Yes) return;
-
-            var result = BatchRenameService.Execute(plan);
-
-            // Обновляем список файлов и остаёмся на текущем файле (возможно, под новым именем)
-            var currentPath = _folderFiles[_currentIndex];
-            if (result.OldToNew.TryGetValue(currentPath, out var renamedCurrent))
-                currentPath = renamedCurrent;
-
-            _folderFiles = Directory.EnumerateFiles(folder)
-                .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-                .ToList();
-            SortFolderFiles();
-
-            _currentIndex = _folderFiles.FindIndex(f =>
-                string.Equals(f, currentPath, StringComparison.OrdinalIgnoreCase));
-            if (_currentIndex < 0 && _folderFiles.Count > 0) _currentIndex = 0;
-
-            if (_currentIndex >= 0) ShowCurrent();
-            else ShowNoAccessibleFilesState();
-
-            if (result.ErrorMessage != null)
-            {
-                MessageBox.Show(
-                    Loc.T($"Renamed {result.RenamedCount} of {plan.Count} file(s).", $"Переименовано {result.RenamedCount} из {plan.Count} файл(ов).", $"Renombrados {result.RenamedCount} de {plan.Count} archivo(s).") + $"\n\n{result.ErrorMessage}",
-                    Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-            else
-            {
-                MessageBox.Show(Loc.T($"Renamed {result.RenamedCount} file(s).", $"Переименовано файл(ов): {result.RenamedCount}.", $"Renombrados: {result.RenamedCount} archivo(s)."),
-                    Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), MessageBoxButton.OK, MessageBoxImage.Information);
-            }
+                var plan = await Task.Run(() => BatchRenameService.BuildPlan(folder, recursive, start,
+                    padding, SupportedExtensions, operation,
+                    files => SortFileSnapshot(files, mode, descending, metaSnapshot)));
+                operation.Token.ThrowIfCancellationRequested();
+                if (_closeAfterOperation) return;
+                if (plan.Count == 0)
+                {
+                    MessageBox.Show(Loc.T("Nothing to rename.", "Нечего переименовывать.", "Nada que renombrar."), "PhotoMusicViewer");
+                    return;
+                }
+                var example = plan[0];
+                int photos = plan.Count(p => !p.Companion), companions = plan.Count - photos;
+                var folders = plan.Select(p => Path.GetDirectoryName(p.OldPath)!).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                string question = Loc.T($"Rename {photos} photo(s)?", $"Переименовать фото: {photos}?", $"¿Renombrar {photos} foto(s)?");
+                if (companions > 0)
+                {
+                    string kinds = string.Join(", ", plan.Where(p => p.Companion).Select(p => CompanionKind(p.OldPath)).Distinct());
+                    question += "\n" + Loc.T($"Together with {companions} companion file(s) with the same name ({kinds}) — they get the same number.",
+                        $"Вместе с ними — файлы-спутники с тем же именем ({kinds}): {companions}. Они получат тот же номер.",
+                        $"Junto con {companions} archivo(s) asociados ({kinds}), con el mismo número.");
+                }
+                if (folders.Count > 1)
+                {
+                    var shown = folders.Take(6).Select(f => "  • " + (string.Equals(f, folder, StringComparison.OrdinalIgnoreCase) ? "." : Path.GetRelativePath(folder, f)));
+                    question += "\n\n" + Loc.T($"In {folders.Count} folders:", $"В папках ({folders.Count}):", $"En {folders.Count} carpetas:") + "\n" +
+                        string.Join("\n", shown) + (folders.Count > 6 ? "\n  …" : "");
+                }
+                var exampleGroup = plan.Where(p => p.Group == example.Group).Select(p => Path.GetFileName(p.OldPath) + " → " + Path.GetFileName(p.NewPath)).Take(4);
+                var confirm = MessageBox.Show(_operationOwner,
+                    question +
+                    "\n\n" + string.Join("\n", exampleGroup) + "\n" +
+                    Loc.T("Numbering order: ", "Порядок нумерации: ", "Orden de numeración: ") + orderText + "\n\n" +
+                    Loc.T("Existing files are never overwritten. Cancellation stops between photos (a RAW+JPG pair is never split); completed renames are not undone.",
+                          "Существующие файлы не перезаписываются. Отмена останавливает работу между снимками (пара RAW+JPG не разделяется); выполненные переименования не откатываются.",
+                          "No se sobrescriben archivos. La cancelación se detiene entre fotos (un par RAW+JPG no se separa); lo ya renombrado no se deshace."),
+                    "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (confirm != MessageBoxResult.Yes) return;
+                string current = _folderFiles[_currentIndex];
+                var result = await Task.Run(() => BatchRenameService.Execute(plan, operation));
+                operation.Finalizing(FileOperationStage.Refreshing, result.RenamedCount);
+                if (result.OldToNew.TryGetValue(current, out var renamed)) current = renamed;
+                _folderFiles = _folderFiles.Select(f => result.OldToNew.TryGetValue(f, out var mapped) ? mapped : f).ToList();
+                _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, current, StringComparison.OrdinalIgnoreCase));
+                // После частичной отмены результаты всё равно применяются. Refresh без отменённого токена.
+                try
+                {
+                    _folderFiles = await Task.Run(() => SortFileSnapshot(Directory.EnumerateFiles(folder)
+                        .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant())).ToList(), mode, descending));
+                    _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, current, StringComparison.OrdinalIgnoreCase));
+                    if (_currentIndex < 0 && _folderFiles.Count > 0) _currentIndex = 0;
+                }
+                catch (Exception ex) { AppLog.Warn("PhotoView.BatchRename.Refresh", ex); }
+                if (_closeAfterOperation) return;
+                string summary = Loc.T($"Renamed {result.RenamedCount} of {plan.Count} file(s).",
+                    $"Переименовано {result.RenamedCount} из {plan.Count} файл(ов).", $"Renombrados {result.RenamedCount} de {plan.Count} archivos.");
+                if (result.Cancelled) summary += "\n" + Loc.T("Cancelled between files.", "Отменено между файлами.", "Cancelado entre archivos.");
+                if (result.ErrorMessage != null) summary += "\n\n" + result.ErrorMessage;
+                MessageBox.Show(_operationOwner, summary, "PhotoMusicViewer", MessageBoxButton.OK,
+                    result.ErrorMessage != null ? MessageBoxImage.Warning : MessageBoxImage.Information);
+            });
         }
 
-        // --- Удаление метаданных (EXIF) ---
+        /// <summary>Вид файла-спутника для подтверждения: RAW, .xmp, .AAE, .MOV, резервная копия.</summary>
+        private static string CompanionKind(string path)
+        {
+            string name = Path.GetFileName(path);
+            if (name.Contains(ImageSaveWriter.OriginalMarker, StringComparison.OrdinalIgnoreCase) || name.Contains(ImageSaveWriter.EditedMarker, StringComparison.OrdinalIgnoreCase))
+                return Loc.T("backups", "резервные копии", "copias");
+            string ext = Path.GetExtension(name).ToLowerInvariant();
+            return ext is ".xmp" or ".aae" or ".thm" or ".pp3" or ".dop" or ".on1" or ".arp" or ".mov" or ".mp4" or ".wav" || SupportedExtensions.Contains(ext)
+                ? ext : "RAW";
+        }
+
+        /// <summary>Текущая сортировка словами — для подтверждения массового переименования.</summary>
+        private static string SortOrderDescription(SortMode mode, bool descending)
+        {
+            string key = mode switch
+            {
+                SortMode.DateModified => Loc.T("date modified", "дата изменения", "fecha de modificación"),
+                SortMode.Size => Loc.T("size", "размер", "tamaño"),
+                SortMode.Type => Loc.T("type", "тип", "tipo"),
+                _ => Loc.T("name", "имя", "nombre")
+            };
+            return key + (descending ? " ↓" : " ↑") + Loc.T(" (as in the viewer)", " (как в просмотре)", " (como en el visor)");
+        }
 
         private void StripExifButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_currentIndex < 0) return;
-            if (ThumbnailOverlay.Visibility == Visibility.Visible) return;
-
-            var path = _folderFiles[_currentIndex];
-
+            if (_fileOperation != null || _currentIndex < 0 || ThumbnailOverlay.Visibility == Visibility.Visible) return;
+            string path = _folderFiles[_currentIndex];
             if (!StripExifService.CanStrip(path))
             {
-                MessageBox.Show(Loc.T("Metadata removal isn't supported for this file format.", "Удаление метаданных не поддерживается для этого формата файла.", "La eliminación de metadatos no es compatible con este formato de archivo."),
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(Loc.T("Metadata removal is not supported for this format.",
+                    "Удаление метаданных не поддерживается для этого формата.", "No se admite eliminar metadatos en este formato."), "PhotoMusicViewer");
                 return;
             }
-
-            var choice = MessageBox.Show(
-                Loc.T("Remove all metadata (EXIF, GPS, camera info) from this file?", "Удалить все метаданные (EXIF, GPS, данные камеры) из этого файла?", "¿Eliminar todos los metadatos (EXIF, GPS, datos de la cámara) de este archivo?") + "\n\n" +
-                Loc.T("The image will be re-encoded and the original file will be replaced.", "Изображение будет перекодировано, а исходный файл заменён.", "La imagen se recodificará y el archivo original será reemplazado."),
-                Loc.T("Strip EXIF", "Удаление EXIF", "Quitar EXIF"), MessageBoxButton.YesNo, MessageBoxImage.Question);
-
-            if (choice != MessageBoxResult.Yes) return;
-
-            try
+            if (_viewRotationDegrees != 0) return;
+            var options = new ImageSaveOptionsWindow(Window.GetWindow(this), path, strip: true);
+            if (options.ShowDialog() != true) return;
+            bool saveCopy = options.Copy, reencode = options.Reencode;
+            _ = RunFileOperationAsync(Loc.T("Strip metadata", "Удаление метаданных", "Eliminar metadatos"), async operation =>
             {
-                StripExifService.StripMetadata(path);
-                ShowCurrent();
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error("PhotoView.StripMetadata", ex);
-                MessageBox.Show(Loc.T("Metadata removal failed", "Не удалось удалить метаданные", "Error al eliminar metadatos") + $": {ex.Message}",
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
+                string saved = await BackgroundFileWorker.Run(() => StripExifService.SaveStripped(path, saveCopy, reencode, operation));
+                CompleteImageSave(saved);
+            });
         }
 
         // --- Обрезка (Crop) ---
 
         private bool _isCropMode;
+        private FileVersion? _cropSourceVersion;
         private Rect _cropRectDisplay;   // рамка обрезки в координатах CropOverlay
         private Rect _cropImageBounds;   // границы отображаемого изображения в координатах CropOverlay
 
@@ -2014,6 +2543,7 @@ private void ReapplySort()
 
         private void CropButton_Click(object sender, RoutedEventArgs e)
         {
+    if (_fileOperation != null || _viewRotationDegrees != 0) return;
             if (_isCropMode)
             {
                 ExitCropMode();
@@ -2037,6 +2567,14 @@ private void ReapplySort()
 
         private void EnterCropMode()
         {
+            // Версия файла на момент начала обрезки: если его потом изменит синхронизация
+            // или другая программа, рамка относится к другому снимку — сохранение откажет.
+            _cropSourceVersion = null;
+            if (_currentIndex >= 0)
+            {
+                try { _cropSourceVersion = FileVersion.Read(_folderFiles[_currentIndex]); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { AppLog.Debug("PhotoView.CropVersion", ex); }
+            }
             _isCropMode = true;
             ResetTransform();
             EnsureCropVisuals();
@@ -2091,6 +2629,7 @@ private void ReapplySort()
 
             if (active) GifPlayPauseButton.Visibility = Visibility.Collapsed;
             else UpdateGifButtonVisibility();
+            RefreshRotationUi();
         }
 
         private void EnsureCropVisuals()
@@ -2374,10 +2913,23 @@ private void ReapplySort()
         }
 
         private void CropSaveButton_Click(object sender, RoutedEventArgs e) => ApplyCrop();
-        private void CropCancelButton_Click(object sender, RoutedEventArgs e) => ExitCropMode();
+        private void CropCancelButton_Click(object sender, RoutedEventArgs e) { if (_fileOperation == null) ExitCropMode(); }
+
+        private static Int32Rect MapCropToSource(Rect selection, Rect bounds, int width, int height)
+        {
+            if (bounds.Width <= 0 || bounds.Height <= 0 || width <= 0 || height <= 0)
+                throw new ArgumentException("Invalid crop image bounds.");
+            double sx = width / bounds.Width, sy = height / bounds.Height;
+            int x = Math.Clamp((int)Math.Round((selection.X - bounds.X) * sx), 0, width - 1);
+            int y = Math.Clamp((int)Math.Round((selection.Y - bounds.Y) * sy), 0, height - 1);
+            int w = Math.Clamp((int)Math.Round(selection.Width * sx), 1, width - x);
+            int h = Math.Clamp((int)Math.Round(selection.Height * sy), 1, height - y);
+            return new Int32Rect(x, y, w, h);
+        }
 
         private void ApplyCrop()
         {
+    if (_fileOperation != null) return;
             if (!_isCropMode || _currentIndex < 0) return;
             if (MainImage.Source is not BitmapSource source) return;
             if (_cropImageBounds.Width <= 0 || _cropImageBounds.Height <= 0) return;
@@ -2387,19 +2939,8 @@ private void ReapplySort()
             int sourceWidth = _currentWidth > 0 ? _currentWidth : source.PixelWidth;
             int sourceHeight = _currentHeight > 0 ? _currentHeight : source.PixelHeight;
 
-            // Перевод рамки из экранных координат в пиксели исходника
-            double sx = sourceWidth / _cropImageBounds.Width;
-            double sy = sourceHeight / _cropImageBounds.Height;
-
-            int px = (int)Math.Round((_cropRectDisplay.X - _cropImageBounds.X) * sx);
-            int py = (int)Math.Round((_cropRectDisplay.Y - _cropImageBounds.Y) * sy);
-            int pw = (int)Math.Round(_cropRectDisplay.Width * sx);
-            int ph = (int)Math.Round(_cropRectDisplay.Height * sy);
-
-            px = Math.Clamp(px, 0, sourceWidth - 1);
-            py = Math.Clamp(py, 0, sourceHeight - 1);
-            pw = Math.Clamp(pw, 1, sourceWidth - px);
-            ph = Math.Clamp(ph, 1, sourceHeight - py);
+            var cropRect = MapCropToSource(_cropRectDisplay, _cropImageBounds, sourceWidth, sourceHeight);
+            int pw = cropRect.Width, ph = cropRect.Height;
 
             if (pw == sourceWidth && ph == sourceHeight)
             {
@@ -2409,60 +2950,53 @@ private void ReapplySort()
             }
 
             var path = _folderFiles[_currentIndex];
-            bool replaceOriginal;
 
-            if (CropAndSaveService.CanEncodeInPlace(path))
+            // Обрезка JPEG без потерь: план считается по заголовку файла (быстро, без пикселей).
+            JpegLossless.LosslessCropPlan? plan = null; string? unavailable = null;
+            if (JpegLossless.IsJpeg(path))
             {
-                var choice = MessageBox.Show(
-                    Loc.T("Replace the original file?", "Заменить исходный файл?", "¿Reemplazar el archivo original?") + "\n\n" +
-                    Loc.T("Yes — overwrite the original", "Да — перезаписать оригинал", "Sí — sobrescribir el original") + "\n" +
-                    Loc.T("No — save as a copy", "Нет — сохранить как копию", "No — guardar como copia") + "\n" +
-                    Loc.T("Cancel — continue cropping", "Отмена — продолжить обрезку", "Cancelar — seguir recortando"),
-                    Loc.T("Save cropped image", "Сохранение обрезки", "Guardar imagen recortada"), MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
-
-                if (choice == MessageBoxResult.Cancel) return;
-                replaceOriginal = choice == MessageBoxResult.Yes;
-            }
-            else
-            {
-                var choice = MessageBox.Show(
-                    Loc.T("This format can't be re-encoded in place,\nso the crop will be saved as a PNG copy. Continue?", "Этот формат нельзя перекодировать на месте,\nпоэтому обрезка будет сохранена как PNG-копия. Продолжить?", "Este formato no se puede recodificar en el mismo archivo,\nasí que el recorte se guardará como copia PNG. ¿Continuar?"),
-                    Loc.T("Save cropped image", "Сохранение обрезки", "Guardar imagen recortada"), MessageBoxButton.OKCancel, MessageBoxImage.Question);
-
-                if (choice != MessageBoxResult.OK) return;
-                replaceOriginal = false;
-            }
-
-            try
-            {
-                string savedPath = CropAndSaveService.CropAndSave(
-                    path, new Int32Rect(px, py, pw, ph), replaceOriginal);
-
-                ExitCropMode();
-
-                if (replaceOriginal)
-                {
-                    ShowCurrent();
-                }
+                if (!JpegLossless.HelperAvailable())
+                    unavailable = Loc.T("the jpegtran helper (tools\\jpegtran, Windows x64 only) was not found.",
+                                        "не найден помощник jpegtran (tools\\jpegtran, только Windows x64).",
+                                        "no se encontró jpegtran (tools\\jpegtran, solo Windows x64).");
                 else
                 {
-                    // Показываем созданную копию
-                    if (!_folderFiles.Contains(savedPath, StringComparer.OrdinalIgnoreCase))
-                        _folderFiles.Add(savedPath);
-
-                    SortFolderFiles();
-                    _currentIndex = _folderFiles.FindIndex(f =>
-                        string.Equals(f, savedPath, StringComparison.OrdinalIgnoreCase));
-                    if (_currentIndex < 0) _currentIndex = 0;
-                    ShowCurrent();
+                    try
+                    {
+                        var p = JpegLossless.PlanCrop(path, new JpegLossless.PixelRect(cropRect.X, cropRect.Y, cropRect.Width, cropRect.Height));
+                        var (dw, dh) = JpegLossless.DisplaySize(p.Header);
+                        if (dw == sourceWidth && dh == sourceHeight) plan = p;
+                        else unavailable = Loc.T("the file size differs from the displayed image.", "размер файла не совпадает с показанным снимком.", "el tamaño no coincide con la imagen mostrada.");
+                    }
+                    catch (Exception ex) when (ex is IOException or InvalidDataException or NotSupportedException or UnauthorizedAccessException)
+                    {
+                        AppLog.Debug("PhotoView.PlanLosslessCrop", ex);
+                        unavailable = ex.Message;
+                    }
                 }
             }
-            catch (Exception ex)
+
+            var dialog = new CropSaveDialog(Window.GetWindow(this), path, pw, ph, plan, unavailable);
+            if (dialog.ShowDialog() != true) return; // «Отмена» — продолжаем обрезку
+            bool replaceOriginal = dialog.ReplaceOriginal;
+            var method = dialog.Method;
+            var expectedVersion = _cropSourceVersion;
+
+            var mode = _sortMode; bool descending = _sortDescending;
+            _ = RunFileOperationAsync(Loc.T("Crop", "Обрезка", "Recortar"), async operation =>
             {
-                AppLog.Error("PhotoView.CropAndSave", ex);
-                MessageBox.Show(Loc.T("Crop failed", "Не удалось обрезать", "Error al recortar") + $": {ex.Message}",
-                    "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
+                string savedPath = await BackgroundFileWorker.Run(() => CropAndSaveService.Save(path, cropRect, replaceOriginal, method, expectedVersion, operation));
+                operation.Finalizing(FileOperationStage.Refreshing);
+                ExitCropMode();
+                if (!replaceOriginal)
+                {
+                    if (!_folderFiles.Contains(savedPath, StringComparer.OrdinalIgnoreCase)) _folderFiles.Add(savedPath);
+                    _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, savedPath, StringComparison.OrdinalIgnoreCase));
+                    var files = _folderFiles.ToList();
+                    _folderFiles = await Task.Run(() => SortFileSnapshot(files, mode, descending));
+                    _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, savedPath, StringComparison.OrdinalIgnoreCase));
+                }
+            });
         }
 
         // --- Переключение режима ---

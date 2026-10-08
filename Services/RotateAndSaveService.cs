@@ -6,33 +6,31 @@ namespace PhotoMusicViewer.Services
 {
     public static class RotateAndSaveService
     {
-        public static void RotateAndSave(string path, int degrees)
+        // Compatibility API: explicit original replacement, with persistent recovery backup.
+        public static void RotateAndSave(string path, int degrees, FileOperationContext? operation = null) =>
+            SaveRotation(path, degrees, copy: false, allowReencode: false, operation);
+
+        public static string SaveRotation(string path, int degrees, bool copy = true, bool allowReencode = false, FileOperationContext? operation = null)
         {
+            if (degrees % 90 != 0) throw new ArgumentException("Right-angle rotation required.");
+            var version = FileVersion.Read(path);
+            if (JpegLossless.IsJpeg(path) && !allowReencode)
+                return ImageSaveWriter.Write(path, copy, "_rotated", output => JpegLossless.Transform(path, output, degrees, strip: false, operation?.Token ?? default), operation, version);
             var ext = Path.GetExtension(path).ToLowerInvariant();
             BitmapEncoder encoder = ext switch
             {
-                // QualityLevel 95: без этого JPEG пережимался с качеством 75 при каждом повороте
                 ".jpg" or ".jpeg" or ".jfif" => new JpegBitmapEncoder { QualityLevel = 95 },
-                ".png" => new PngBitmapEncoder(),
-                ".bmp" => new BmpBitmapEncoder(),
+                ".png" => new PngBitmapEncoder(), ".bmp" => new BmpBitmapEncoder(),
                 ".tiff" or ".tif" => new TiffBitmapEncoder(),
                 _ => throw new NotSupportedException($"No encoder available for {ext}")
             };
-
-            // Метаданные при пересохранении не переносятся (так задумано ради приватности),
-            // поэтому тег EXIF-ориентации пропадёт — «запекаем» его в пиксели до поворота.
-            // SafeImageDecoder дополнительно защищает от файлов с битым EXIF.
-            var source = SafeImageDecoder.LoadOriented(path);
-
-            var rotated = new TransformedBitmap(source,
-                new System.Windows.Media.RotateTransform(NormalizeDegrees(degrees)));
+            operation?.Checkpoint(FileOperationStage.Decoding);
+            var source = SafeImageDecoder.LoadDecoded(path, 0, rejectMultiPageTiff: true, token: operation?.Token ?? default).Image;
+            var rotated = new TransformedBitmap(source, new System.Windows.Media.RotateTransform(NormalizeDegrees(degrees)));
             if (rotated.CanFreeze) rotated.Freeze();
-
+            operation?.Checkpoint(FileOperationStage.Encoding);
             encoder.Frames.Add(BitmapFrame.Create(rotated));
-
-            // Запись во временный файл рядом с оригиналом и замена одной операцией
-            // файловой системы: при любом сбое на месте останется целый файл
-            SafeFileReplace.WriteThenReplace(path, stream => encoder.Save(stream));
+            return ImageSaveWriter.Write(path, copy, "_rotated", stream => encoder.Save(stream), operation, version);
         }
 
         private static double NormalizeDegrees(int degrees)

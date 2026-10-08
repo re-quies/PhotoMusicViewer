@@ -12,12 +12,6 @@ using System.Windows.Media.Imaging;
 
 namespace PhotoMusicViewer.Services
 {
-    /// <summary>Ошибка перевода с уже понятным пользователю текстом (без стека и без ключей).</summary>
-    public sealed class TranslationException : Exception
-    {
-        public TranslationException(string message) : base(message) { }
-    }
-
     /// <summary>
     /// Результат запроса. SourceText заполняется только когда текст получен из картинки
     /// (режимы «фото → текст» и «фото → текст + перевод»).
@@ -37,7 +31,8 @@ namespace PhotoMusicViewer.Services
     {
         // Один общий HttpClient на процесс. Реальный таймаут задаётся через CancellationToken,
         // поэтому собственный таймаут клиента выставлен с большим запасом.
-        private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(15) };
+        private static readonly HttpClient Http = NetworkHttpClientFactory.Create();
+        private static readonly HttpClient LocalHttp = NetworkHttpClientFactory.Create(loopbackOnly: true);
 
         // Пробуем v1beta, затем v1: на разных ключах и моделях доступны разные версии API
         private static readonly string[] GeminiHosts =
@@ -46,6 +41,24 @@ namespace PhotoMusicViewer.Services
             "https://generativelanguage.googleapis.com/v1"
         };
         private const string CloudTranslateUrl = "https://translation.googleapis.com/language/translate/v2";
+
+        internal static string GetEndpoint(TranslationProvider provider, NetworkDataKind kind, TranslationSettings settings) => provider switch
+        {
+            TranslationProvider.DeepL => DeepLBase(settings),
+            TranslationProvider.Google => kind == NetworkDataKind.Image || settings.GoogleEngine != GoogleTextEngine.CloudTranslationV2
+                ? GeminiHosts[0] : CloudTranslateUrl,
+            _ => QwenBase(settings)
+        };
+        internal static IEnumerable<string> GetProbeEndpoints(TranslationSettings settings)
+        {
+            if (HasDeepLKey(settings)) yield return DeepLBase(settings);
+            if (HasGoogleKey(settings)) yield return GetEndpoint(TranslationProvider.Google, NetworkDataKind.ServiceProbe, settings);
+            if (HasQwenKey(settings))
+            {
+                yield return QwenBase(settings);
+                yield return QwenIntlBase; yield return QwenBeijingBase; yield return QwenUsBase; yield return QwenCodingBase;
+            }
+        }
 
         public static bool HasDeepLKey(TranslationSettings s) => !string.IsNullOrWhiteSpace(s.DeepLKey);
         public static bool HasGoogleKey(TranslationSettings s) => !string.IsNullOrWhiteSpace(s.GoogleKey);
@@ -56,6 +69,8 @@ namespace PhotoMusicViewer.Services
         public static async Task<TranslationResult> TranslateWithDeepLAsync(
             string text, TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.Text, DeepLBase(settings));
+
             RequireText(text);
             if (!HasDeepLKey(settings))
                 throw new TranslationException(Loc.T(
@@ -89,7 +104,7 @@ namespace PhotoMusicViewer.Services
             request.Headers.TryAddWithoutValidation("Authorization", "DeepL-Auth-Key " + settings.DeepLKey.Trim());
             request.Content = new FormUrlEncodedContent(fields);
 
-            string body = await SendAsync(request, "DeepL", settings, ct).ConfigureAwait(false);
+            string body = await SendAsync(request, "DeepL", settings, ct, NetworkDataKind.Text).ConfigureAwait(false);
 
             try
             {
@@ -117,13 +132,15 @@ namespace PhotoMusicViewer.Services
         /// <summary>Проверка ключа DeepL: показывает израсходованный объём символов.</summary>
         public static async Task<string> CheckDeepLAsync(TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, DeepLBase(settings));
+
             if (!HasDeepLKey(settings))
                 throw new TranslationException(Loc.T("No DeepL API key.", "Не указан ключ DeepL.", "Falta la clave de DeepL."));
 
             using var request = new HttpRequestMessage(HttpMethod.Get, DeepLBase(settings) + "/v2/usage");
             request.Headers.TryAddWithoutValidation("Authorization", "DeepL-Auth-Key " + settings.DeepLKey.Trim());
 
-            string body = await SendAsync(request, "DeepL", settings, ct).ConfigureAwait(false);
+            string body = await SendAsync(request, "DeepL", settings, ct, NetworkDataKind.ServiceProbe).ConfigureAwait(false);
 
             try
             {
@@ -160,6 +177,8 @@ namespace PhotoMusicViewer.Services
         public static async Task<TranslationResult> TranslateWithGoogleAsync(
             string text, TranslationSettings settings, string? promptTemplate, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.Text, GetEndpoint(TranslationProvider.Google, NetworkDataKind.Text, settings));
+
             RequireText(text);
             RequireGoogleKey(settings);
 
@@ -172,14 +191,18 @@ namespace PhotoMusicViewer.Services
                 promptTemplate ?? settings.SelectedPrompt?.Text ?? "", text, targetName, sourceName);
 
             var parts = new List<object> { new Dictionary<string, object?> { ["text"] = prompt } };
-            string answer = await GeminiAsync(parts, settings, ct).ConfigureAwait(false);
+            string answer = await GeminiAsync(parts, settings, ct, NetworkDataKind.Text).ConfigureAwait(false);
 
             return new TranslationResult(
                 "Google " + settings.GeminiModel, null, answer.Trim(), null, null);
         }
 
-        private static async Task<TranslationResult> CloudTranslateAsync(
-            string text, TranslationSettings settings, CancellationToken ct)
+        /// <summary>
+        /// Запрос к Cloud Translation v2. Ключ — заголовком x-goog-api-key, как у Gemini.
+        /// В адресе (?key=) он оседал в журналах прокси, корпоративных шлюзов
+        /// и средств отладки HTTP. Адрес запроса ключа не содержит.
+        /// </summary>
+        internal static HttpRequestMessage BuildCloudTranslateRequest(string text, TranslationSettings settings)
         {
             var fields = new List<KeyValuePair<string, string>>
             {
@@ -191,11 +214,18 @@ namespace PhotoMusicViewer.Services
             if (!string.IsNullOrWhiteSpace(settings.SourceLanguage))
                 fields.Add(new("source", TranslationLanguages.GoogleCode(settings.SourceLanguage)));
 
-            using var request = new HttpRequestMessage(
-                HttpMethod.Post, CloudTranslateUrl + "?key=" + Uri.EscapeDataString(settings.GoogleKey.Trim()));
+            var request = new HttpRequestMessage(HttpMethod.Post, CloudTranslateUrl);
+            request.Headers.TryAddWithoutValidation("x-goog-api-key", settings.GoogleKey.Trim());
             request.Content = new FormUrlEncodedContent(fields);
+            return request;
+        }
 
-            string body = await SendAsync(request, "Google Translate", settings, ct).ConfigureAwait(false);
+        private static async Task<TranslationResult> CloudTranslateAsync(
+            string text, TranslationSettings settings, CancellationToken ct, NetworkDataKind kind = NetworkDataKind.Text)
+        {
+            using var request = BuildCloudTranslateRequest(text, settings);
+
+            string body = await SendAsync(request, "Google Translate", settings, ct, kind).ConfigureAwait(false);
 
             try
             {
@@ -229,6 +259,8 @@ namespace PhotoMusicViewer.Services
         public static async Task<TranslationResult> RecognizeImageWithGoogleAsync(
             string imagePath, TranslationSettings settings, bool alsoTranslate, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.Image, GeminiHosts[0]);
+
             RequireGoogleKey(settings);
 
             if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
@@ -237,7 +269,7 @@ namespace PhotoMusicViewer.Services
                     "Файл изображения больше недоступен.",
                     "El archivo de imagen ya no está disponible."));
 
-            var prepared = await Task.Run(() => PrepareImage(imagePath, settings), ct).ConfigureAwait(false);
+            var prepared = await Task.Run(() => PrepareImage(imagePath, settings, ct), ct).ConfigureAwait(false);
 
             string targetName = TranslationLanguages.EnglishName(settings.TargetLanguage);
             string template = alsoTranslate ? settings.ImageOcrTranslatePrompt : settings.ImageOcrPrompt;
@@ -257,7 +289,7 @@ namespace PhotoMusicViewer.Services
                 }
             };
 
-            string answer = (await GeminiAsync(parts, settings, ct).ConfigureAwait(false)).Trim();
+            string answer = (await GeminiAsync(parts, settings, ct, NetworkDataKind.Image).ConfigureAwait(false)).Trim();
 
             string note = string.Format(
                 Loc.T("Sent to Google: {0} ({1} KB)", "Отправлено в Google: {0} ({1} КБ)", "Enviado a Google: {0} ({1} KB)"),
@@ -296,11 +328,13 @@ namespace PhotoMusicViewer.Services
         /// <summary>Проверка ключа Google: запрашивает описание выбранной модели.</summary>
         public static async Task<string> CheckGoogleAsync(TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, GetEndpoint(TranslationProvider.Google, NetworkDataKind.ServiceProbe, settings));
+
             RequireGoogleKey(settings);
 
             if (settings.GoogleEngine == GoogleTextEngine.CloudTranslationV2)
             {
-                var probe = await CloudTranslateAsync("ping", settings, ct).ConfigureAwait(false);
+                var probe = await CloudTranslateAsync("ping", settings, ct, NetworkDataKind.ServiceProbe).ConfigureAwait(false);
                 return "Google Translate v2 OK — \"ping\" -> \"" + probe.Translation + "\"";
             }
 
@@ -327,6 +361,8 @@ namespace PhotoMusicViewer.Services
         /// <summary>Список доступных моделей Gemini для выпадающего списка настроек.</summary>
         public static async Task<List<string>> ListGeminiModelsAsync(TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, GeminiHosts[0]);
+
             RequireGoogleKey(settings);
 
             string body = await SendGeminiAsync(
@@ -397,7 +433,7 @@ namespace PhotoMusicViewer.Services
         /// не подходит (400/404), автоматически пробуем следующую.
         /// </summary>
         private static async Task<string> SendGeminiAsync(
-            Func<string, HttpRequestMessage> build, TranslationSettings settings, CancellationToken ct)
+            Func<string, HttpRequestMessage> build, TranslationSettings settings, CancellationToken ct, NetworkDataKind kind = NetworkDataKind.ServiceProbe)
         {
             TranslationException? firstError = null;
 
@@ -408,7 +444,7 @@ namespace PhotoMusicViewer.Services
 
                 try
                 {
-                    return await SendAsync(request, "Google", settings, ct).ConfigureAwait(false);
+                    return await SendAsync(request, "Google", settings, ct, kind).ConfigureAwait(false);
                 }
                 catch (TranslationException ex)
                     when (i + 1 < GeminiHosts.Length &&
@@ -466,7 +502,7 @@ namespace PhotoMusicViewer.Services
         }
 
         private static async Task<string> GeminiAsync(
-            List<object> parts, TranslationSettings settings, CancellationToken ct)
+            List<object> parts, TranslationSettings settings, CancellationToken ct, NetworkDataKind kind)
         {
             var payload = new Dictionary<string, object?>
             {
@@ -491,7 +527,7 @@ namespace PhotoMusicViewer.Services
                 HttpMethod.Post, $"{host}/models/{model}:generateContent")
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
-            }, settings, ct).ConfigureAwait(false);
+            }, settings, ct, kind).ConfigureAwait(false);
 
             try
             {
@@ -566,7 +602,7 @@ namespace PhotoMusicViewer.Services
         {
             if (settings.QwenRegion == QwenRegionMode.Custom)
             {
-                string custom = NormalizeQwenBase(settings.QwenBaseUrl);
+                string custom = NormalizeQwenBase(settings.QwenBaseUrl, settings.QwenAllowLoopbackHttp);
                 if (custom.Length == 0)
                     throw new TranslationException(Loc.T(
                         "Qwen: the custom address is empty. Paste the Base URL from the Model Studio console.",
@@ -589,24 +625,8 @@ namespace PhotoMusicViewer.Services
         /// хвостовые косые черты и /chat/completions, добавляет /compatible-mode/v1,
         /// если скопировали только домен рабочего пространства.
         /// </summary>
-        private static string NormalizeQwenBase(string? url)
-        {
-            string result = (url ?? "").Trim().Trim('"', '\'').TrimEnd('/');
-            if (result.Length == 0) return "";
-
-            if (!result.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-                !result.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                result = "https://" + result;
-
-            const string tail = "/chat/completions";
-            if (result.EndsWith(tail, StringComparison.OrdinalIgnoreCase))
-                result = result.Substring(0, result.Length - tail.Length);
-
-            if (!result.Contains("/v1", StringComparison.OrdinalIgnoreCase))
-                result += "/compatible-mode/v1";
-
-            return result.TrimEnd('/');
-        }
+        private static string NormalizeQwenBase(string? url, bool allowLoopbackHttp = false) =>
+            NetworkEndpointPolicy.NormalizeQwenBase(url, allowLoopbackHttp);
 
         /// <summary>
         /// Чистит ключ перед отправкой: из консоли его нередко копируют вместе с
@@ -657,6 +677,8 @@ namespace PhotoMusicViewer.Services
         public static async Task<TranslationResult> TranslateWithQwenAsync(
             string text, TranslationSettings settings, string? promptTemplate, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.Text, QwenBase(settings));
+
             RequireText(text);
             RequireQwenKey(settings);
 
@@ -666,7 +688,7 @@ namespace PhotoMusicViewer.Services
                 promptTemplate ?? settings.SelectedPrompt?.Text ?? "", text, targetName, sourceName);
 
             string model = NormalizeQwenModel(settings.QwenModel, "qwen-plus");
-            string answer = await QwenChatAsync(model, prompt, settings, ct).ConfigureAwait(false);
+            string answer = await QwenChatAsync(model, prompt, settings, ct, NetworkDataKind.Text).ConfigureAwait(false);
 
             return new TranslationResult("Qwen " + model, null, answer.Trim(), null, null);
         }
@@ -678,6 +700,8 @@ namespace PhotoMusicViewer.Services
         public static async Task<TranslationResult> RecognizeImageWithQwenAsync(
             string imagePath, TranslationSettings settings, bool alsoTranslate, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.Image, QwenBase(settings));
+
             RequireQwenKey(settings);
 
             if (string.IsNullOrWhiteSpace(imagePath) || !File.Exists(imagePath))
@@ -686,7 +710,7 @@ namespace PhotoMusicViewer.Services
                     "Файл изображения больше недоступен.",
                     "El archivo de imagen ya no está disponible."));
 
-            var prepared = await Task.Run(() => PrepareImage(imagePath, settings), ct).ConfigureAwait(false);
+            var prepared = await Task.Run(() => PrepareImage(imagePath, settings, ct), ct).ConfigureAwait(false);
 
             string targetName = TranslationLanguages.EnglishName(settings.TargetLanguage);
             string template = alsoTranslate ? settings.ImageOcrTranslatePrompt : settings.ImageOcrPrompt;
@@ -707,7 +731,7 @@ namespace PhotoMusicViewer.Services
             };
 
             string model = NormalizeQwenModel(settings.QwenVisionModel, "qwen-vl-max");
-            string answer = (await QwenChatAsync(model, content, settings, ct).ConfigureAwait(false)).Trim();
+            string answer = (await QwenChatAsync(model, content, settings, ct, NetworkDataKind.Image).ConfigureAwait(false)).Trim();
 
             string note = string.Format(
                 Loc.T("Sent to Qwen: {0} ({1} KB)", "Отправлено в Qwen: {0} ({1} КБ)", "Enviado a Qwen: {0} ({1} KB)"),
@@ -723,6 +747,8 @@ namespace PhotoMusicViewer.Services
         /// </summary>
         public static async Task<string> CheckQwenAsync(TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, QwenBase(settings));
+
             RequireQwenKey(settings);
 
             string model = NormalizeQwenModel(settings.QwenModel, "qwen-plus");
@@ -744,8 +770,8 @@ namespace PhotoMusicViewer.Services
 
                 if (match == null)
                     throw new TranslationException(ex.Message + "\n\n" + Loc.T(
-                        "No known Qwen address accepted this key. Check the key itself, or paste your workspace Base URL.",
-                        "Ни один известный адрес Qwen не принял этот ключ. Проверьте сам ключ или вставьте Base URL своего рабочего пространства.",
+                        "No permitted Qwen address accepted this key. Check the key itself, or paste your workspace Base URL.",
+                        "Ни один разрешённый адрес Qwen не принял этот ключ. Проверьте сам ключ или вставьте Base URL своего рабочего пространства.",
                         "Ninguna dirección conocida de Qwen aceptó la clave. Revise la clave o pegue la Base URL de su espacio de trabajo."));
 
                 throw new TranslationException(string.Format(
@@ -817,6 +843,8 @@ namespace PhotoMusicViewer.Services
         private static async Task QwenPingAsync(
             string baseUrl, string model, TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, baseUrl);
+
             var payload = new Dictionary<string, object?>
             {
                 ["model"] = model,
@@ -833,7 +861,7 @@ namespace PhotoMusicViewer.Services
             };
             AddQwenAuth(request, settings);
 
-            await SendAsync(request, "Qwen", settings, ct).ConfigureAwait(false);
+            await SendAsync(request, "Qwen", settings, ct, NetworkDataKind.ServiceProbe).ConfigureAwait(false);
         }
 
         /// <summary>Ищет адрес, который принимает этот ключ. Возвращает подпись пункта списка.</summary>
@@ -855,6 +883,7 @@ namespace PhotoMusicViewer.Services
             foreach (var (label, url) in candidates)
             {
                 if (string.Equals(url, current, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!NetworkConsent.IsAllowed(NetworkDataKind.ServiceProbe, url)) continue;
 
                 try
                 {
@@ -885,6 +914,8 @@ namespace PhotoMusicViewer.Services
         /// </summary>
         public static async Task<List<string>> ListQwenModelsAsync(TranslationSettings settings, CancellationToken ct)
         {
+            NetworkConsent.Require(NetworkDataKind.ServiceProbe, QwenBase(settings));
+
             RequireQwenKey(settings);
 
             var models = new List<string>();
@@ -894,7 +925,7 @@ namespace PhotoMusicViewer.Services
                 using var request = new HttpRequestMessage(HttpMethod.Get, QwenBase(settings) + "/models");
                 AddQwenAuth(request, settings);
 
-                string body = await SendAsync(request, "Qwen", settings, ct).ConfigureAwait(false);
+                string body = await SendAsync(request, "Qwen", settings, ct, NetworkDataKind.ServiceProbe).ConfigureAwait(false);
 
                 using var doc = JsonDocument.Parse(body);
                 if (doc.RootElement.TryGetProperty("data", out var list) && list.ValueKind == JsonValueKind.Array)
@@ -928,7 +959,7 @@ namespace PhotoMusicViewer.Services
         /// либо список частей (картинка + текст) для моделей со зрением.
         /// </summary>
         private static async Task<string> QwenChatAsync(
-            string model, object content, TranslationSettings settings, CancellationToken ct)
+            string model, object content, TranslationSettings settings, CancellationToken ct, NetworkDataKind kind)
         {
             var payload = new Dictionary<string, object?>
             {
@@ -950,7 +981,7 @@ namespace PhotoMusicViewer.Services
             };
             AddQwenAuth(request, settings);
 
-            string body = await SendAsync(request, "Qwen", settings, ct).ConfigureAwait(false);
+            string body = await SendAsync(request, "Qwen", settings, ct, kind).ConfigureAwait(false);
 
             try
             {
@@ -1032,7 +1063,7 @@ namespace PhotoMusicViewer.Services
             string key = CleanQwenKey(settings);
             bool planKey = key.StartsWith("sk-sp-", StringComparison.OrdinalIgnoreCase);
             bool planEndpoint = settings.QwenRegion == QwenRegionMode.CodingPlan ||
-                NormalizeQwenBase(settings.QwenBaseUrl).Contains("coding", StringComparison.OrdinalIgnoreCase);
+                (settings.QwenRegion == QwenRegionMode.Custom && QwenBase(settings).Contains("coding", StringComparison.OrdinalIgnoreCase));
 
             if (planKey && !planEndpoint)
                 throw new TranslationException(Loc.T(
@@ -1056,25 +1087,13 @@ namespace PhotoMusicViewer.Services
         /// MaxImageSide и пересжимает в JPEG. Пересжатие заодно убирает EXIF/GPS —
         /// в сеть уходят только пиксели.
         /// </summary>
-        private static PreparedImage PrepareImage(string path, TranslationSettings settings)
+        private static PreparedImage PrepareImage(string path, TranslationSettings settings, CancellationToken token)
         {
-            byte[] raw = File.ReadAllBytes(path);
-            var ext = Path.GetExtension(path).ToLowerInvariant();
-
-            byte[] original = raw;
-            using var input = new MemoryStream(raw);
-            var decoder = BitmapDecoder.Create(input,
-                BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile,
-                BitmapCacheOption.OnLoad);
-            var frame = decoder.Frames[0];
-
             int limit = Math.Clamp(settings.MaxImageSide, 512, 4096);
-            int maxSide = Math.Max(frame.PixelWidth, frame.PixelHeight);
-            bool needsResize = maxSide > limit;
-
-            // Без пересжатия отправляем исходный файл как есть — но только
-            // для форматов, которые понимает API, и если уменьшать не требуется
-            if (!settings.StripMetadataBeforeSend && !needsResize && original.Length <= 15 * 1024 * 1024)
+            var decoded = SafeImageDecoder.LoadDecoded(path, limit, token: token);
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            bool needsResize = Math.Max(decoded.NaturalWidth, decoded.NaturalHeight) > limit;
+            if (!settings.StripMetadataBeforeSend && !needsResize && decoded.FileBytes <= 15L * 1024 * 1024)
             {
                 string? directMime = ext switch
                 {
@@ -1082,25 +1101,15 @@ namespace PhotoMusicViewer.Services
                     ".png" => "image/png",
                     ".webp" => "image/webp",
                     ".heic" => "image/heic",
+                    ".heif" or ".hif" => "image/heif",
                     _ => null
                 };
-
                 if (directMime != null)
-                    return new PreparedImage(original, directMime,
-                        $"{Path.GetFileName(path)}, {frame.PixelWidth}x{frame.PixelHeight}, " +
+                    return new PreparedImage(SafeImageDecoder.ReadOriginalForUpload(path, token), directMime,
+                        $"{Path.GetFileName(path)}, {decoded.NaturalWidth}x{decoded.NaturalHeight}, " +
                         Loc.T("original file with metadata", "исходный файл с метаданными", "archivo original con metadatos"));
             }
-
-            BitmapSource image = ExifOrientationService.ApplyOrientation(
-                frame, ExifOrientationService.GetOrientation(frame));
-
-            if (needsResize)
-            {
-                double scale = (double)limit / maxSide;
-                image = new TransformedBitmap(image, new ScaleTransform(scale, scale));
-            }
-
-            if (image.CanFreeze) image.Freeze();
+            BitmapSource image = decoded.Image;
 
             // BitmapFrame.Create(BitmapSource) не переносит метаданные — EXIF/GPS не уедут в сеть
             var encoder = new JpegBitmapEncoder { QualityLevel = 90 };
@@ -1159,15 +1168,17 @@ namespace PhotoMusicViewer.Services
         }
 
         private static async Task<string> SendAsync(
-            HttpRequestMessage request, string service, TranslationSettings settings, CancellationToken ct)
+            HttpRequestMessage request, string service, TranslationSettings settings, CancellationToken ct, NetworkDataKind kind)
         {
+            NetworkEndpointPolicy.ValidateTransport(request.RequestUri ?? throw new TranslationException("Missing API URL."), settings.QwenAllowLoopbackHttp);
+            NetworkConsent.Require(kind, request.RequestUri!.AbsoluteUri);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(settings.TimeoutSeconds, 5, 600)));
 
             HttpResponseMessage response;
             try
             {
-                response = await Http.SendAsync(request, HttpCompletionOption.ResponseContentRead, cts.Token)
+                response = await (request.RequestUri!.Scheme == Uri.UriSchemeHttp ? LocalHttp : Http).SendAsync(request, HttpCompletionOption.ResponseContentRead, cts.Token)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1213,6 +1224,9 @@ namespace PhotoMusicViewer.Services
                 int code = (int)response.StatusCode;
                 string hint = code switch
                 {
+                    >= 300 and < 400 => Loc.T("Redirects are blocked for security. Verify the API address.",
+                        "Перенаправления запрещены для безопасности. Проверьте адрес API.",
+                        "Las redirecciones están bloqueadas por seguridad. Verifique la dirección API."),
                     400 => Loc.T(
                         "Check the model name and the target language. If the service says the key is invalid, the key may be for a different API (Gemini keys come from Google AI Studio).",
                         "Проверьте название модели и язык перевода. Если сервис пишет, что ключ неверный, ключ может быть от другого API (ключи Gemini выдаёт Google AI Studio).",
