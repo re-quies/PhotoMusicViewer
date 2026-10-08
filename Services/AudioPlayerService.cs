@@ -15,7 +15,7 @@ namespace PhotoMusicViewer.Services
         private readonly DispatcherTimer _positionTimer = new();
 
         private WaveOutEvent? _waveOut;
-        private WaveStream? _naudioReader; // VorbisWaveReader или OpusFileReader
+        private WaveStream? _naudioReader; // Ogg Vorbis / Ogg Opus / MP4 Opus
         private SpeedSampleProvider? _speedProvider; // регулятор скорости для NAudio-ветки
 
         private Backend _backend = Backend.MediaPlayer;
@@ -107,23 +107,13 @@ public bool Load(string path)
         if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Audio path is empty.", nameof(path));
         path = Path.GetFullPath(path);
         if (!File.Exists(path)) throw new FileNotFoundException("Audio file does not exist.", path);
-        var ext = Path.GetExtension(path).ToLowerInvariant();
-        if (ext == ".ogg" || ext == ".opus")
+        var format = AudioFormatProbe.Read(path);
+        if (format.Codec is AudioCodec.Opus or AudioCodec.Vorbis)
         {
             _backend = Backend.NAudio;
-
-            try
-            {
-                _naudioReader = ext == ".opus"
-                    ? new OpusFileReader(path)
-                    : new VorbisWaveReader(path);
-            }
-            catch (Exception ex)
-            {
-                // Не Ogg Vorbis — пробуем как Ogg Opus
-                AppLog.Debug("AudioPlayerService.OpenVorbis → Opus", ex);
-                _naudioReader = new OpusFileReader(path);
-            }
+            _naudioReader = format.Codec == AudioCodec.Vorbis
+                ? new VorbisWaveReader(path)
+                : new OpusFileReader(path);
 
             // Opus теперь потоковый, без ограничения длительности по размеру PCM.
             // Ошибка Read/LastError поступит в WaveOut_PlaybackStopped и PlaybackError.

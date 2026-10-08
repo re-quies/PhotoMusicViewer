@@ -4,7 +4,26 @@
         Title="Batch rename" Width="380" SizeToContent="Height"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False"
         Background="{StaticResource BackgroundBrush}">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Margin="16">
+        <TextBlock x:Name="FolderLabel" Text="Folder" Foreground="{StaticResource ForegroundBrush}"/>
+        <DockPanel Margin="0,4,0,12">
+            <Button x:Name="BrowseFolderButton" DockPanel.Dock="Right" Content="Browse…" Padding="8,3" Margin="6,0,0,0" Click="BrowseFolder_Click"/>
+            <TextBox x:Name="FolderPathBox" IsReadOnly="True" Background="{StaticResource PanelBrush}" Foreground="{StaticResource ForegroundBrush}" BorderBrush="{StaticResource AccentBrush}" Padding="4,3"/>
+        </DockPanel>
+        <TextBlock x:Name="MediaTypesLabel" Text="File types" Foreground="{StaticResource ForegroundBrush}"/>
+        <CheckBox x:Name="PhotosCheck" Content="Photos / RAW" IsChecked="True" Foreground="{StaticResource ForegroundBrush}" Margin="0,4,0,2"/>
+        <CheckBox x:Name="VideosCheck" Content="Videos" IsChecked="False" Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,2"/>
+        <CheckBox x:Name="MusicCheck" Content="Music / audio" IsChecked="False" Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,2"/>
+        <CheckBox x:Name="CompanionsCheck" Content="Include sidecars and backups" IsChecked="True" Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,6"/>
+        <TextBlock x:Name="MediaTypesHint" Foreground="{StaticResource ForegroundBrush}" Opacity="0.65" TextWrapping="Wrap" Margin="20,0,0,12" FontSize="11"/>
+
+        <TextBlock x:Name="RenameModeLabel" Text="Rename mode" Foreground="{StaticResource ForegroundBrush}"/>
+        <ComboBox x:Name="RenameModeCombo" Margin="0,4,0,12" SelectedIndex="0">
+            <ComboBoxItem x:Name="NonNumericModeItem" Content="Only non-numeric names"/>
+            <ComboBoxItem x:Name="AllNamesModeItem" Content="All selected files, including numeric names"/>
+        </ComboBox>
+
         <TextBlock x:Name="StartNumberLabel" Text="Start number" Foreground="{StaticResource ForegroundBrush}"/>
         <TextBox x:Name="StartNumberBox" Text="1" Margin="0,4,0,12" Padding="4,2"
                  Background="{StaticResource PanelBrush}"
@@ -13,21 +32,28 @@
                  CaretBrush="{StaticResource ForegroundBrush}"/>
 
         <TextBlock x:Name="PaddingLabel" Text="Digits in number (zero padding)" Foreground="{StaticResource ForegroundBrush}"/>
-        <ComboBox x:Name="PaddingCombo" Margin="0,4,0,12" SelectedIndex="2">
+        <ComboBox x:Name="PaddingCombo" Margin="0,4,0,4" SelectedIndex="2" SelectionChanged="PaddingCombo_SelectionChanged">
             <ComboBoxItem Content="1   (1, 2, 3)"/>
             <ComboBoxItem Content="2   (01, 02, 03)"/>
             <ComboBoxItem Content="3   (001, 002, 003)"/>
             <ComboBoxItem Content="4   (0001, 0002, 0003)"/>
             <ComboBoxItem Content="5   (00001, 00002, 00003)"/>
             <ComboBoxItem Content="6   (000001, 000002, 000003)"/>
+            <ComboBoxItem Content="a, b, c … z, aa, ab …"/>
+            <ComboBoxItem Content="aa, ab, ac … az, ba …"/>
+            <ComboBoxItem Content="aaa, aab, aac … azz, baa …"/>
+            <ComboBoxItem Content="0a, 0b, 0c … 0z, 1a …"/>
+            <ComboBoxItem Content="00a, 00b, 00c … 00z, 01a …"/>
+            <ComboBoxItem Content="000a, 000b … 000z, 001a …"/>
         </ComboBox>
 
+        <TextBlock x:Name="NameSequenceHint" Foreground="{StaticResource ForegroundBrush}" Opacity="0.65" TextWrapping="Wrap" Margin="0,0,0,12" FontSize="11"/>
         <CheckBox x:Name="RecursiveCheck" Content="Include subfolders"
                   Foreground="{StaticResource ForegroundBrush}" Margin="0,0,0,2"/>
         <TextBlock x:Name="RecursiveHint" Foreground="{StaticResource ForegroundBrush}" Opacity="0.65"
                    TextWrapping="Wrap" Margin="20,0,0,12" FontSize="11"/>
 
-        <TextBlock x:Name="InfoText" Text="Only photo and GIF files are renamed. Files whose names are already numbers are skipped. Existing files are never overwritten."
+        <TextBlock x:Name="InfoText" Text="The default mode skips numeric names. All-selected mode renames them too. Existing numbers remain reserved, so numbering may contain gaps. Existing files are never overwritten."
                    Foreground="{StaticResource ForegroundBrush}" Opacity="0.65"
                    TextWrapping="Wrap" Margin="0,0,0,16"/>
 
@@ -36,4 +62,5 @@
             <Button x:Name="CancelButton" Content="Cancel" Width="80" IsCancel="True"/>
         </StackPanel>
     </StackPanel>
+    </ScrollViewer>
 </Window>

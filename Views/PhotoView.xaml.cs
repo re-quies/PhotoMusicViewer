@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -108,26 +108,34 @@ private sealed class ThumbnailRow
 private void OpenThumbnailGrid()
 {
     if (_fileOperation != null) return;
-    if (_currentIndex < 0 || _folderFiles.Count == 0) return;
-
-    string currentFolder = Path.GetDirectoryName(_folderFiles[_currentIndex])!;
+    string? currentFolder = _currentIndex >= 0 && _currentIndex < _folderFiles.Count
+        ? Path.GetDirectoryName(_folderFiles[_currentIndex]) : _gridCurrentFolder;
+    if (string.IsNullOrEmpty(currentFolder) || !Directory.Exists(currentFolder)) return;
     ThumbnailOverlay.Visibility = Visibility.Visible;
     LoadGridFolder(currentFolder);
 }
 private int _gridGeneration;
 private Dictionary<string, FolderEntry> _gridMeta = new(StringComparer.OrdinalIgnoreCase);
+private CancellationTokenSource? _gridScanCts;
+private bool _gridFolderLoading;
 
 /// <summary>
 /// Открывает папку в сетке. Листинг и сортировка идут в фоне: на сетевой папке или
 /// каталоге с тысячами файлов окно больше не замирает. Пока список собирается,
 /// видна только кнопка «назад».
 /// </summary>
-private async void LoadGridFolder(string folderPath)
+private void LoadGridFolder(string folderPath) => _ = LoadGridFolderAsync(folderPath);
+private async Task LoadGridFolderAsync(string folderPath)
 {
     if (_fileOperation != null) return;
+    _gridScanCts?.Cancel(); _gridScanCts?.Dispose();
+    _gridScanCts = new CancellationTokenSource();
+    var token = _gridScanCts.Token;
+    _gridFolderLoading = true;
     _thumbnailLoadCts?.Cancel();
     _visibleThumbnailCts?.Cancel();
     _gridCurrentFolder = folderPath;
+    UpdateGridFolderStatus();
     int generation = ++_gridGeneration;
     _thumbnailItems.Clear();
 
@@ -159,16 +167,19 @@ private async void LoadGridFolder(string folderPath)
         (subfolders, imageFiles, meta) = await Task.Run(() =>
         {
             List<string> dirs;
-            try { dirs = FolderScanner.ScanDirectories(folderPath); }
+            try { dirs = FolderScanner.ScanDirectories(folderPath, token); }
             catch (Exception ex) when (ex is not OperationCanceledException) { AppLog.Warn("PhotoView.EnumerateDirectories", ex); dirs = new List<string>(); }
             List<FolderEntry> entries;
-            try { entries = FolderScanner.ScanFiles(folderPath, IsSupportedImagePath); }
+            try { entries = FolderScanner.ScanFiles(folderPath, IsSupportedImagePath, token); }
             catch (Exception ex) when (ex is not OperationCanceledException) { AppLog.Warn("PhotoView.EnumerateFiles", ex); entries = new List<FolderEntry>(); }
+            token.ThrowIfCancellationRequested();
             ImageSaveWriter.IndexFolder(folderPath);
+            token.ThrowIfCancellationRequested();
             var lookup = FolderScanner.ToLookup(entries);
             return (dirs, SortFileSnapshot(entries.Select(e => e.Path).ToList(), mode, descending, lookup), lookup);
-        });
+        }, token);
     }
+    catch (OperationCanceledException) { if (generation == _gridGeneration) _gridFolderLoading = false; return; }
     catch (Exception ex)
     {
         AppLog.Warn("PhotoView.LoadGridFolder", ex);
@@ -176,7 +187,8 @@ private async void LoadGridFolder(string folderPath)
     }
 
     // Пока шёл листинг, пользователь мог закрыть сетку или уйти в другую папку
-    if (generation != _gridGeneration || ThumbnailOverlay.Visibility != Visibility.Visible) return;
+    if (generation != _gridGeneration || token.IsCancellationRequested || ThumbnailOverlay.Visibility != Visibility.Visible) return;
+    _gridFolderLoading = false;
     if (mode != _sortMode || descending != _sortDescending)
         imageFiles = SortFileSnapshot(imageFiles, _sortMode, _sortDescending, meta);
     _gridMeta = meta;
@@ -187,6 +199,7 @@ private async void LoadGridFolder(string folderPath)
     foreach (var file in imageFiles)
         _thumbnailItems.Add(new ThumbnailItem { Kind = ItemKind.Image, Path = file });
 
+    UpdateGridFolderStatus();
     BuildThumbnailRows();
     ThumbnailItemsControl.ItemsSource = _thumbnailRows;
 
@@ -208,8 +221,21 @@ private async void LoadGridFolder(string folderPath)
             QueueVisibleThumbnails();
         }));
 }
+private void UpdateGridFolderStatus()
+{
+    if (GridFolderStatus == null || string.IsNullOrEmpty(_gridCurrentFolder)) return;
+    int count = _thumbnailItems.Count(i => i.Kind == ItemKind.Image);
+    GridFolderStatus.Text = _gridCurrentFolder + "\n" + (_gridFolderLoading
+        ? Loc.T("Loading…", "Загрузка…", "Cargando…")
+        : count == 0
+            ? Loc.T("No supported photos in this folder.", "В этой папке нет поддерживаемых фотографий.", "No hay fotos compatibles en esta carpeta.")
+            : Loc.T($"Photos: {count}", $"Фотографий: {count}", $"Fotos: {count}"));
+}
 private void CloseThumbnailGrid()
 {
+    ++_gridGeneration;
+    _gridFolderLoading = false;
+    _gridScanCts?.Cancel(); _gridScanCts?.Dispose(); _gridScanCts = null;
     _thumbnailLoadCts?.Cancel(); _visibleThumbnailCts?.Cancel();
     foreach (var item in _thumbnailItems) { item.Thumbnail = null; item.LoadRequested = false; }
     ThumbnailOverlay.Visibility = Visibility.Collapsed;
@@ -600,10 +626,15 @@ private void UpdateThumbnailItemSize()
 
         public event Action<bool>? FullscreenRequested;
         public event Action<bool>? ModeSwitchRequested;
+        public event Action<IReadOnlyCollection<string>>? MediaRenameStarting;
+        public event Action<IReadOnlyDictionary<string, string>>? MediaRenameCompleted;
 
         public PhotoView()
 {
     InitializeComponent();
+    _openButtonTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background, Dispatcher);
+    _openButtonTimer.Tick += OpenButtonSingleTick;
+    Unloaded += (_, _) => CancelOpenButtonGesture();
 
     // Потолок декодирования по размеру экрана: с запасом на зум и HiDPI,
     // но без холостых сотен мегабайт на каждый снимок
@@ -648,17 +679,43 @@ private void UpdateThumbnailItemSize()
             var window = Window.GetWindow(this);
             if (window != null)
             {
-                window.Deactivated += (_, __) => CommitRename();
+                window.Deactivated += (_, __) => { CancelOpenButtonGesture(); CommitRename(); };
                 window.Closing += OperationWindowClosing;
+                window.Closing += (_, __) => CancelOpenButtonGesture();
                 _windowHooked = true;
             }
         }
     };
 }
 
+        public void OpenFolder(string path)
+{
+    CancelOpenButtonGesture();
+    if (_fileOperation != null) return;
+    string folder;
+    try { folder = Path.GetFullPath(path); if (!Directory.Exists(folder)) return; }
+    catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+    { AppLog.Warn("PhotoView.OpenFolder", ex); return; }
+    CommitRename();
+    _folderScanCts?.Cancel();
+    ++_folderListGeneration;
+    StopWatchingFolder();
+    ResetCurrentImageState();
+    _folderFiles = new List<string>();
+    _folderMeta = new Dictionary<string, FolderEntry>(StringComparer.OrdinalIgnoreCase);
+    _folderListLoading = false;
+    ApplySortPreference();
+    FileNameDisplay.Text = folder;
+    FileMetaText.Text = Loc.T("Choose a photo in the grid", "Выберите фотографию в сетке", "Elija una foto en la cuadrícula");
+    ThumbnailOverlay.Visibility = Visibility.Visible;
+    LoadGridFolder(folder);
+}
+
         public void OpenFile(string path)
 {
+    CancelOpenButtonGesture();
     if (_fileOperation != null) return;
+    if (Directory.Exists(path)) { OpenFolder(path); return; }
     if (!File.Exists(path)) return;
 
     // Файл может прийти через drag&drop в любом состоянии интерфейса - приводим его в порядок
@@ -2262,6 +2319,8 @@ private void CommitRename()
             PhotoModeToggleBtn.Content = Loc.T("Photo", "Фото", "Foto");
             MusicModeToggleBtn.Content = Loc.T("Music", "Музыка", "Música");
             OpenButton.Content = Loc.T("Open", "Открыть", "Abrir");
+            OpenButton.ToolTip = Loc.T("Click: open an image. Double-click: open a folder.", "Щелчок — открыть фото. Двойной щелчок — открыть папку.", "Clic: abrir imagen. Doble clic: abrir carpeta.");
+            UpdateGridFolderStatus();
             RotateButton.Content = Loc.T("Rotate view", "Повернуть вид", "Girar vista");
             RotateButton.ToolTip = Loc.T("View only — the file is unchanged. Use Save rotation to write a copy.", "Только просмотр — файл не меняется. Для записи используйте «Сохранить поворот».", "Solo vista: archivo sin cambios. Use Guardar giro para crear copia.");
             RefreshRotationUi();
@@ -2288,7 +2347,11 @@ private void CommitRename()
 
             // Текст-заглушка виден, только пока файл не открыт
             if (_currentIndex < 0)
-                FileNameDisplay.Text = Loc.T("No file opened", "Файл не открыт", "Ningún archivo abierto");
+            {
+                FileNameDisplay.Text = _gridCurrentFolder ?? Loc.T("No file opened", "Файл не открыт", "Ningún archivo abierto");
+                if (ThumbnailOverlay.Visibility == Visibility.Visible)
+                    FileMetaText.Text = Loc.T("Choose a photo in the grid", "Выберите фотографию в сетке", "Elija una foto en la cuadrícula");
+            }
         }
 
         private static void SetComboItemText(ComboBox combo, int index, string text)
@@ -2316,19 +2379,87 @@ private void CommitRename()
 
         // --- Открытие файла вручную ---
 
+        private readonly OpenButtonGesture _openButtonGesture = new();
+        private readonly System.Windows.Threading.DispatcherTimer _openButtonTimer;
+        private bool _openMouseActivation;
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", ExactSpelling = true)]
+        private static extern uint GetDoubleClickTime();
+
+        private void CancelOpenButtonGesture()
+        {
+            _openButtonTimer.Stop();
+            _openButtonGesture.Cancel();
+            _openMouseActivation = false;
+        }
+        private void OpenButton_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (_fileOperation != null) { CancelOpenButtonGesture(); e.Handled = true; return; }
+            // Stop before the second press: a delayed file dialog must not appear
+            // while the user is completing a double click or holding the button.
+            _openButtonTimer.Stop();
+            _openButtonGesture.MouseDown(e.ClickCount);
+            _openMouseActivation = true;
+        }
+        private void OpenButton_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!OpenButton.IsMouseOver) CancelOpenButtonGesture();
+        }
         private void OpenButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_fileOperation != null) { CancelOpenButtonGesture(); return; }
+            bool mouse = _openMouseActivation && InputManager.Current.MostRecentInputDevice is MouseDevice;
+            _openMouseActivation = false;
+            _openButtonTimer.Stop();
+            var action = mouse ? _openButtonGesture.MouseClick() : _openButtonGesture.KeyboardClick();
+            if (_openButtonGesture.SinglePending)
+            {
+                _openButtonTimer.Interval = TimeSpan.FromMilliseconds(OpenButtonGesture.DelayMilliseconds(GetDoubleClickTime()));
+                _openButtonTimer.Start();
+            }
+            else RunOpenButtonAction(action);
+        }
+        private void OpenButtonSingleTick(object? sender, EventArgs e)
+        {
+            _openButtonTimer.Stop();
+            var action = _openButtonGesture.SingleExpired();
+            if (!IsLoaded || !IsVisible || Window.GetWindow(this)?.IsActive != true) { CancelOpenButtonGesture(); return; }
+            RunOpenButtonAction(action);
+        }
+        private void RunOpenButtonAction(OpenButtonAction action)
+        {
+            if (_fileOperation != null) return;
+            // All gesture state is consumed BEFORE entering a modal dialog.
+            if (action == OpenButtonAction.Image) OpenImagePicker();
+            else if (action == OpenButtonAction.Folder) OpenFolderPicker();
+        }
+
+        private void OpenImagePicker()
+        {
+            if (_fileOperation != null) return;
             var dialog = new OpenFileDialog
             {
-                        // Фильтр строится из того же списка, что папки и перетаскивание, — не расходятся.
-                        Filter = "Images|" + string.Join(";", SupportedExtensions.Select(ext => "*" + ext))
+                Filter = "Images|" + string.Join(";", SupportedExtensions.Select(ext => "*" + ext))
             };
+            if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+            RecentTracesService.Erase(dialog.FileName);
+            OpenFile(dialog.FileName);
+        }
 
-            if (dialog.ShowDialog() == true)
-    {
-        RecentTracesService.Erase(dialog.FileName);
-        OpenFile(dialog.FileName);
-    }
+        private void OpenFolderPicker()
+        {
+            if (_fileOperation != null) return;
+            var dialog = new OpenFolderDialog
+            {
+                Title = Loc.T("Open photo folder", "Открыть папку с фотографиями", "Abrir carpeta de fotos"),
+                Multiselect = false
+            };
+            string? currentFolder = _currentIndex >= 0 && _currentIndex < _folderFiles.Count
+                ? Path.GetDirectoryName(_folderFiles[_currentIndex]) : _gridCurrentFolder;
+            if (!string.IsNullOrEmpty(currentFolder) && Directory.Exists(currentFolder)) dialog.InitialDirectory = currentFolder;
+            if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+            RecentTracesService.Erase(dialog.FolderName);
+            OpenFolder(dialog.FolderName);
         }
 
         private void SortModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -2392,13 +2523,19 @@ private void ReapplySort()
 
         private void BatchRenameButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_fileOperation != null || _currentIndex < 0 || ThumbnailOverlay.Visibility == Visibility.Visible) return;
+            if (_fileOperation != null || _isCropMode || ThumbnailOverlay.Visibility == Visibility.Visible) return;
             CommitRename();
-            string folder = Path.GetDirectoryName(_folderFiles[_currentIndex])!;
-            var dialog = new BatchRenameDialog { Owner = Window.GetWindow(this) };
+            string initialFolder = _currentIndex >= 0 && _currentIndex < _folderFiles.Count
+                ? Path.GetDirectoryName(_folderFiles[_currentIndex])! : (_gridCurrentFolder ?? "");
+            var dialog = new BatchRenameDialog(initialFolder) { Owner = Window.GetWindow(this) };
             if (dialog.ShowDialog() != true) return;
+            string folder = dialog.FolderPath;
             bool recursive = dialog.Recursive;
+            bool renameNumericNames = dialog.RenameNumericNames;
+            var categories = dialog.MediaCategories;
+            bool includeCompanions = dialog.IncludeCompanions;
             long start = dialog.StartNumber; int padding = dialog.ZeroPadding;
+            var nameScheme = dialog.NameScheme;
             // Корень диска, системные папки и (с подпапками) папки, внутри которых они лежат, — отказ сразу.
             if (BatchRenameService.ScopeProblem(folder, recursive) is { } scopeProblem)
             {
@@ -2413,9 +2550,10 @@ private void ReapplySort()
             string orderText = SortOrderDescription(mode, descending);
             _ = RunFileOperationAsync(Loc.T("Batch rename", "Массовое переименование", "Renombrado masivo"), async operation =>
             {
-                var plan = await Task.Run(() => BatchRenameService.BuildPlan(folder, recursive, start,
-                    padding, SupportedExtensions, operation,
-                    files => SortFileSnapshot(files, mode, descending, metaSnapshot)));
+                var plan = await Task.Run(() => BatchRenameService.BuildMediaPlan(folder, recursive, start,
+                    padding, categories, operation,
+                    files => SortFileSnapshot(files, mode, descending, metaSnapshot),
+                    renameNumericNames: renameNumericNames, includeCompanions: includeCompanions, nameScheme: nameScheme));
                 operation.Token.ThrowIfCancellationRequested();
                 if (_closeAfterOperation) return;
                 if (plan.Count == 0)
@@ -2424,9 +2562,19 @@ private void ReapplySort()
                     return;
                 }
                 var example = plan[0];
-                int photos = plan.Count(p => !p.Companion), companions = plan.Count - photos;
+                int mediaFiles = plan.Count(p => !p.Companion), companions = plan.Count - mediaFiles;
                 var folders = plan.Select(p => Path.GetDirectoryName(p.OldPath)!).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                string question = Loc.T($"Rename {photos} photo(s)?", $"Переименовать фото: {photos}?", $"¿Renombrar {photos} foto(s)?");
+                string question = Loc.T($"Rename {mediaFiles} media file(s)?", $"Переименовать медиафайлы: {mediaFiles}?", $"¿Renombrar {mediaFiles} archivos multimedia?");
+                var categoryNames = new List<string>();
+                if (categories.HasFlag(RenameMediaCategories.Photos)) categoryNames.Add(Loc.T("photos/RAW", "фото/RAW", "fotos/RAW"));
+                if (categories.HasFlag(RenameMediaCategories.Videos)) categoryNames.Add(Loc.T("videos", "видео", "vídeos"));
+                if (categories.HasFlag(RenameMediaCategories.Music)) categoryNames.Add(Loc.T("music/audio", "музыка/аудио", "música/audio"));
+                question += "\n" + Loc.T("Selected types: ", "Выбранные типы: ", "Tipos seleccionados: ") + string.Join(", ", categoryNames);
+                question += "\n" + (renameNumericNames
+                    ? Loc.T("Mode: all selected media, including numeric names. Existing numbers are skipped; numbering may contain gaps.",
+                            "Режим: все выбранные медиа, включая числовые имена. Занятые номера пропускаются; нумерация может быть несплошной.",
+                            "Modo: todos los medios seleccionados, incluidos nombres numéricos. Se saltan números ocupados; puede haber huecos.")
+                    : Loc.T("Mode: only non-numeric names.", "Режим: только нечисловые имена.", "Modo: solo nombres no numéricos."));
                 if (companions > 0)
                 {
                     string kinds = string.Join(", ", plan.Where(p => p.Companion).Select(p => CompanionKind(p.OldPath)).Distinct());
@@ -2445,21 +2593,24 @@ private void ReapplySort()
                     question +
                     "\n\n" + string.Join("\n", exampleGroup) + "\n" +
                     Loc.T("Numbering order: ", "Порядок нумерации: ", "Orden de numeración: ") + orderText + "\n\n" +
-                    Loc.T("Existing files are never overwritten. Cancellation stops between photos (a RAW+JPG pair is never split); completed renames are not undone.",
-                          "Существующие файлы не перезаписываются. Отмена останавливает работу между снимками (пара RAW+JPG не разделяется); выполненные переименования не откатываются.",
-                          "No se sobrescriben archivos. La cancelación se detiene entre fotos (un par RAW+JPG no se separa); lo ya renombrado no se deshace."),
+                    Loc.T("Existing files are never overwritten. Cancellation stops between groups (not inside a RAW+JPG pair); completed renames are not undone. If the current music track is included, playback stops before renaming.",
+                          "Существующие файлы не перезаписываются. Отмена останавливает работу между группами (не внутри RAW+JPG); выполненные переименования не откатываются. Если текущий трек включён, воспроизведение остановится перед переименованием.",
+                          "No se sobrescriben archivos. La cancelación se detiene entre grupos (no dentro de RAW+JPG); lo ya renombrado no se deshace. Si se incluye la pista actual, se detiene antes de renombrarla."),
                     "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question);
                 if (confirm != MessageBoxResult.Yes) return;
-                string current = _folderFiles[_currentIndex];
+                MediaRenameStarting?.Invoke(plan.Select(p => p.OldPath).ToArray());
+                string? current = _currentIndex >= 0 && _currentIndex < _folderFiles.Count ? _folderFiles[_currentIndex] : null;
                 var result = await Task.Run(() => BatchRenameService.Execute(plan, operation));
+                MediaRenameCompleted?.Invoke(result.OldToNew);
                 operation.Finalizing(FileOperationStage.Refreshing, result.RenamedCount);
-                if (result.OldToNew.TryGetValue(current, out var renamed)) current = renamed;
+                if (current != null && result.OldToNew.TryGetValue(current, out var renamed)) current = renamed;
                 _folderFiles = _folderFiles.Select(f => result.OldToNew.TryGetValue(f, out var mapped) ? mapped : f).ToList();
                 _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, current, StringComparison.OrdinalIgnoreCase));
                 // После частичной отмены результаты всё равно применяются. Refresh без отменённого токена.
                 try
                 {
-                    _folderFiles = await Task.Run(() => SortFileSnapshot(Directory.EnumerateFiles(folder)
+                    string refreshFolder = current != null ? Path.GetDirectoryName(current)! : folder;
+                    _folderFiles = await Task.Run(() => SortFileSnapshot(Directory.EnumerateFiles(refreshFolder)
                         .Where(f => SupportedExtensions.Contains(Path.GetExtension(f).ToLowerInvariant())).ToList(), mode, descending));
                     _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, current, StringComparison.OrdinalIgnoreCase));
                     if (_currentIndex < 0 && _folderFiles.Count > 0) _currentIndex = 0;

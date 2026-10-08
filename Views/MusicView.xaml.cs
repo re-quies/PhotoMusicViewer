@@ -853,6 +853,8 @@ namespace PhotoMusicViewer.Views
             {
                 var paths = (string[])e.Data.GetData(DataFormats.FileDrop)!;
                 AddPathsToPlaylist(paths);
+                // A folder drop is already handled by the playlist; don't scan it again in MainWindow.
+                if (paths.Any(Directory.Exists)) e.Handled = true;
             }
             _dragSourceIndex = -1;
         }
@@ -918,6 +920,45 @@ namespace PhotoMusicViewer.Views
         {
             MusicModeToggleBtn.IsChecked = true;
             PhotoModeToggleBtn.IsChecked = false;
+        }
+
+        /// <summary>Освобождаем только включённый в подтверждённый план текущий трек.
+        /// Не возобновляем звук автоматически; Play уже умеет загрузить его заново.</summary>
+        public void PrepareForExternalRenames(IReadOnlyCollection<string> sourcePaths)
+        {
+            if (_editingTrack != null && sourcePaths.Contains(_editingTrack.Path, StringComparer.OrdinalIgnoreCase))
+            { _editingTrack.IsEditing = false; _editingTrack = null; }
+            if (_currentIndex < 0 || _currentIndex >= _tracks.Count ||
+                !sourcePaths.Contains(_tracks[_currentIndex].Path, StringComparer.OrdinalIgnoreCase)) return;
+            _player.Unload();
+            SeekSlider.Value = 0;
+            TimeText.Text = "00:00 / 00:00";
+            UpdatePlaybackUi();
+        }
+
+        /// <summary>Отражаем и полное, и частичное/отменённое переименование в плейлисте.</summary>
+        public void ApplyExternalRenames(IReadOnlyDictionary<string, string> mapping)
+        {
+            bool changed = false;
+            foreach (var track in _tracks)
+                if (mapping.TryGetValue(track.Path, out var newPath))
+                {
+                    track.IsEditing = false;
+                    if (ReferenceEquals(_editingTrack, track)) _editingTrack = null;
+                    track.Path = newPath;
+                    changed = true;
+                }
+            if (changed) ReapplySort();
+            if (_currentIndex >= 0 && _currentIndex < _tracks.Count)
+                NowPlayingText.Text = _tracks[_currentIndex].FileName;
+            UpdatePlaybackUi();
+        }
+
+        public void AddFolder(string folder)
+        {
+            if (!Directory.Exists(folder)) return;
+            CommitTrackRename();
+            AddPathsToPlaylist(new[] { folder });
         }
 
         public void OpenFile(string path)

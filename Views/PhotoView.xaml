@@ -59,9 +59,11 @@
         </Grid>
 <Grid x:Name="ThumbnailOverlay" Grid.Row="0" Background="{StaticResource BackgroundBrush}"
       Visibility="Collapsed" SizeChanged="ThumbnailOverlay_SizeChanged">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <TextBlock x:Name="GridFolderStatus" Grid.Row="0" Foreground="{StaticResource ForegroundBrush}" TextWrapping="Wrap" Margin="10,6"/>
     <!-- Виртуализация по строкам: в памяти живут только видимые ячейки,
          поэтому папка с тысячами фото открывается сразу -->
-    <ItemsControl x:Name="ThumbnailItemsControl"
+    <ItemsControl x:Name="ThumbnailItemsControl" Grid.Row="1"
                   VirtualizingPanel.IsVirtualizing="True"
                   VirtualizingPanel.VirtualizationMode="Recycling"
                   ScrollViewer.CanContentScroll="True"
@@ -210,7 +212,9 @@
             Click="SortDirectionButton_Click" Focusable="False" IsTabStop="False"/>
 
     <Button x:Name="OpenButton" Grid.Column="6" Content="Open" Margin="4,4"
-            Click="OpenButton_Click" Focusable="False" IsTabStop="False"/>
+            Click="OpenButton_Click" PreviewMouseLeftButtonDown="OpenButton_PreviewMouseLeftButtonDown"
+            PreviewMouseLeftButtonUp="OpenButton_PreviewMouseLeftButtonUp"
+            Focusable="False" IsTabStop="False"/>
     <Button x:Name="RotateButton" Grid.Column="7" Content="Rotate" Margin="4,4"
             Click="RotateButton_Click" Focusable="False" IsTabStop="False"/>
     <Button x:Name="CropButton" Grid.Column="8" Content="Crop" Margin="4,4"

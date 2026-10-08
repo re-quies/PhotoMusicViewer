@@ -64,14 +64,19 @@ namespace PhotoMusicViewer.Services
             ".xmp", ".aae", ".thm", ".pp3", ".dop", ".on1", ".arp",
             // Live Photo (iPhone), видео и звук к снимку
             ".mov", ".mp4", ".wav",
+            // subtitles follow a selected video, never a photo/audio-only group
+            ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx",
         };
 
         /// <summary>Спутники вида «IMG_0001.CR2.xmp» (darktable, RawTherapee, DxO).</summary>
         private static readonly HashSet<string> DoubleExtensionSidecars = new(StringComparer.OrdinalIgnoreCase)
-        { ".xmp", ".pp3", ".dop", ".on1", ".arp" };
+        { ".xmp", ".pp3", ".dop", ".on1", ".arp", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx" };
+
+        private static readonly HashSet<string> SubtitleExtensions = new(StringComparer.OrdinalIgnoreCase)
+        { ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx" };
 
         private static readonly HashSet<string> OwnerExtensions = new(CompanionExtensions.Concat(new[]
-        { ".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif", ".heic", ".heif", ".hif" }), StringComparer.OrdinalIgnoreCase);
+        { ".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif", ".heic", ".heif", ".hif" }).Concat(BatchRenameMediaTypes.All), StringComparer.OrdinalIgnoreCase);
 
         private static readonly string[] BackupMarkers = { ".pmv-original-", ".pmv-edited-" };
 
@@ -200,23 +205,46 @@ namespace PhotoMusicViewer.Services
             return (stem, ext, null);
         }
 
+        /// <summary>Неотмеченные типы исключаются и как спутники/владельцы метаданных.</summary>
+        public static List<BatchRenamePlanItem> BuildMediaPlan(
+            string folder, bool recursive, long startNumber, int zeroPadding,
+            RenameMediaCategories categories, FileOperationContext? operation = null,
+            Func<List<string>, List<string>>? orderInFolder = null,
+            bool renameNumericNames = false, bool includeCompanions = true, RenameNameScheme? nameScheme = null) =>
+            BuildPlan(folder, recursive, startNumber, zeroPadding, BatchRenameMediaTypes.Selected(categories),
+                operation, orderInFolder, renameNumericNames, includeCompanions, BatchRenameMediaTypes.Excluded(categories), nameScheme);
+
         public static List<BatchRenamePlanItem> BuildPlan(
             string folder,
             bool recursive,
             long startNumber,
             int zeroPadding,
             IReadOnlyCollection<string> extensions, FileOperationContext? operation = null,
-            Func<List<string>, List<string>>? orderInFolder = null)
+            Func<List<string>, List<string>>? orderInFolder = null,
+            bool renameNumericNames = false,
+            bool includeCompanions = true,
+            IReadOnlyCollection<string>? excludedCompanionExtensions = null,
+            RenameNameScheme? nameScheme = null)
         {
+            var scheme = nameScheme ?? new RenameNameScheme(RenameNameStyle.Numeric, zeroPadding);
+            if (startNumber < 0 || (scheme.Style != RenameNameStyle.Numeric && startNumber == 0))
+                throw new ArgumentOutOfRangeException(nameof(startNumber));
             if (ScopeProblem(folder, recursive) is { } problem) throw new BatchRenameScopeException(problem);
 
             // Все файлы в области действия (любых расширений) — нужны для учёта занятых номеров
             var allFiles = new List<string>();
             operation?.Checkpoint(FileOperationStage.Planning);
             CollectFiles(folder, recursive, allFiles, operation);
-            bool IsPhoto(string f) => extensions.Contains(Path.GetExtension(f).ToLowerInvariant());
+            var selectedExtensions = extensions.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var excludedExtensions = (excludedCompanionExtensions ?? Array.Empty<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            bool IsPhoto(string f) => selectedExtensions.Contains(Path.GetExtension(f)); // historic name: any selected primary media
+            bool IsCompanion(string f) => !excludedExtensions.Contains(Path.GetExtension(f)) && CompanionExtensions.Contains(Path.GetExtension(f));
+            bool OwnerAllowed(string owner) => excludedCompanionExtensions == null ||
+                (!excludedExtensions.Contains(Path.GetExtension(owner)) && (IsPhoto(owner) || IsCompanion(owner)));
 
-            // Кандидаты: только поддерживаемые фото/GIF с ещё не числовыми именами.
+            // Кандидаты: поддерживаемые фото/GIF. Старый режим пропускает числовые имена;
+            // дополнительный включает их. Занятые номера ВСЕГДА сохраняются в резерве:
+            // цели не пересекаются с источниками, staging/перезапись не требуются.
             // Порядок нумерации = порядок просмотра: папки идут по очереди (сначала
             // текущая, затем вложенные в естественном порядке), а файлы внутри папки —
             // в выбранной в просмотрщике сортировке (orderInFolder).
@@ -229,15 +257,26 @@ namespace PhotoMusicViewer.Services
                 if (ScopeProblem(folderFiles.Key, false) is { } folderProblem) throw new BatchRenameScopeException(folderProblem);
                 var files = folderFiles.ToList();
                 var names = new HashSet<string>(files.Select(f => Path.GetFileName(f)), StringComparer.OrdinalIgnoreCase);
+                // An unqualified sidecar may belong to an unchecked media file with
+                // the same stem. Leave ambiguous companions unchanged rather than
+                // breaking the unchecked owner's association.
+                var uncheckedOwnerKeys = files.Where(f => excludedExtensions.Contains(Path.GetExtension(f)))
+                    .Select(f => SplitName(Path.GetFileName(f)).Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var selectedVideoKeys = files.Where(f => IsPhoto(f) && BatchRenameMediaTypes.Videos.Contains(Path.GetExtension(f), StringComparer.OrdinalIgnoreCase))
+                    .Select(f => SplitName(Path.GetFileName(f)).Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
                 var byKey = new Dictionary<string, List<(string Path, string Tail, bool Photo)>>(StringComparer.OrdinalIgnoreCase);
                 foreach (var f in files)
                 {
                     var (key, tail, owner) = SplitName(Path.GetFileName(f));
-                    if (key.Length == 0 || IsNumericName(key)) continue;
+                    if (key.Length == 0 || (!renameNumericNames && IsNumericName(key))) continue;
                     bool photo = owner == null && IsPhoto(f);
-                    bool member = photo
-                        || owner == null && CompanionExtensions.Contains(Path.GetExtension(f))
-                        || owner != null && names.Contains(owner);
+                    bool subtitle = SubtitleExtensions.Contains(Path.GetExtension(f));
+                    bool subtitleOwner = subtitle && selectedVideoKeys.Contains(key) &&
+                        (owner == null || BatchRenameMediaTypes.Videos.Contains(Path.GetExtension(owner), StringComparer.OrdinalIgnoreCase));
+                    bool member = photo || includeCompanions && (
+                        owner == null && IsCompanion(f) &&
+                            (subtitle ? subtitleOwner : !uncheckedOwnerKeys.Contains(key))
+                        || owner != null && names.Contains(owner) && OwnerAllowed(owner) && (!subtitle || subtitleOwner));
                     if (!member) continue;
                     if (!byKey.TryGetValue(key, out var list)) byKey[key] = list = new();
                     // На файловых системах с учётом регистра «a.JPG» и «a.jpg» дали бы одно имя.
@@ -270,14 +309,22 @@ namespace PhotoMusicViewer.Services
                 }
             }
 
-            // Занятые номера — числовые имена любых существующих файлов в области действия
+            // Занятые номера — числовые имена любых существующих файлов в области действия.
+            // Включая участвующие в новом режиме исходники: не освобождать их во время
+            // планирования, иначе появятся циклы/пересечения old -> new и риск потери.
             var usedNumbers = new HashSet<long>();
+            var usedStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in allFiles)
             {
                 operation?.Token.ThrowIfCancellationRequested();
                 var n = SplitName(Path.GetFileName(f)).Key;
-                if (IsNumericName(n) && long.TryParse(n, out var num))
-                    usedNumbers.Add(num);
+                usedStems.Add(n);
+                if (scheme.Style == RenameNameStyle.Numeric)
+                {
+                    if (IsNumericName(n) && long.TryParse(n, out var num))
+                        usedNumbers.Add(num);
+                }
+                else if (scheme.TryGetPosition(n, out long ordinal)) usedNumbers.Add(ordinal);
             }
 
             var plan = new List<BatchRenamePlanItem>();
@@ -294,8 +341,11 @@ namespace PhotoMusicViewer.Services
                 List<string> targets;
                 while (true)
                 {
-                    while (usedNumbers.Contains(current)) current = checked(current + 1);
-                    string number = current.ToString().PadLeft(zeroPadding, '0');
+                    while (usedNumbers.Contains(current))
+                    { operation?.Token.ThrowIfCancellationRequested(); current = checked(current + 1); }
+                    string number = scheme.Format(current);
+                    if (usedStems.Contains(number) || RenameNameScheme.IsWindowsDeviceName(number))
+                    { current = checked(current + 1); continue; }
                     targets = group.Select(m => Path.Combine(dir, number + m.Tail)).ToList();
                     // Страховка: имена свободны и на диске, и в уже запланированных переименованиях
                     if (targets.All(t => !File.Exists(t) && !Directory.Exists(t) && !plannedTargets.Contains(t))) break;
@@ -303,6 +353,7 @@ namespace PhotoMusicViewer.Services
                 }
 
                 usedNumbers.Add(current);
+                usedStems.Add(scheme.Format(current));
                 for (int i = 0; i < group.Count; i++)
                 {
                     plannedTargets.Add(targets[i]);
@@ -392,9 +443,9 @@ namespace PhotoMusicViewer.Services
                         $"Остановлено на «{Path.GetFileName(failed.OldPath)}»: {ex.InnerException!.Message} ",
                         $"Detenido en «{Path.GetFileName(failed.OldPath)}»: {ex.InnerException!.Message} ") +
                         (ex.NotRolledBack.Count == 0
-                            ? Loc.T("This photo and its companion files keep their old names; earlier files keep their new names. Nothing was overwritten or lost.",
-                                    "Этот снимок и его файлы-спутники остались под старыми именами, предыдущие — под новыми. Ничего не перезаписано и не потеряно.",
-                                    "Esta foto y sus archivos asociados conservan sus nombres; los anteriores, los nuevos. No se perdió nada.")
+                            ? Loc.T("This media file and its companion files keep their old names; earlier files keep their new names. Nothing was overwritten or lost.",
+                                    "Этот медиафайл и его спутники остались под старыми именами, предыдущие — под новыми. Ничего не перезаписано и не потеряно.",
+                                    "Este medio y sus archivos asociados conservan sus nombres; los anteriores, los nuevos. No se perdió nada.")
                             : Loc.T("Could not undo the partial rename of: ", "Не удалось вернуть прежние имена: ", "No se pudo deshacer el cambio de nombre de: ") +
                               string.Join(", ", ex.NotRolledBack.Select(i => Path.GetFileName(i.OldPath) + " → " + Path.GetFileName(i.NewPath))) + ".");
                     foreach (var item in ex.NotRolledBack)

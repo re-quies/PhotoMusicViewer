@@ -26,6 +26,8 @@ namespace PhotoMusicViewer
             InitializeComponent();
 
             _photoView.FullscreenRequested += OnFullscreenRequested;
+            _photoView.MediaRenameStarting += _musicView.PrepareForExternalRenames;
+            _photoView.MediaRenameCompleted += _musicView.ApplyExternalRenames;
             _photoView.ModeSwitchRequested += isMusic =>
             {
                 if (isMusic) SwitchToMusic();
@@ -57,6 +59,7 @@ private void SwitchToMusic()
     {
         if (_pendingFilePath == null) return;
 
+        if (Directory.Exists(_pendingFilePath)) { SwitchToPhoto(); _photoView.OpenFolder(_pendingFilePath); return; }
         var ext = Path.GetExtension(_pendingFilePath).ToLowerInvariant();
 
         if (AudioExtensions.Contains(ext))
@@ -88,6 +91,12 @@ private void SwitchToMusic()
             // Перетаскивание тоже может оставить след в "Недавних файлах" - чистим, как и после диалога открытия
             RecentTracesService.Erase(path);
 
+            if (Directory.Exists(path))
+            {
+                if (ReferenceEquals(ModeContent.Content, _musicView)) _musicView.AddFolder(path);
+                else { SwitchToPhoto(); _photoView.OpenFolder(path); }
+                return;
+            }
             var ext = Path.GetExtension(path).ToLowerInvariant();
             if (AudioExtensions.Contains(ext))
             {
@@ -107,6 +116,7 @@ private void SwitchToMusic()
             if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return null;
 
             var path = files[0];
+            if (Directory.Exists(path)) return path;
             if (!File.Exists(path)) return null;
 
             var ext = Path.GetExtension(path).ToLowerInvariant();

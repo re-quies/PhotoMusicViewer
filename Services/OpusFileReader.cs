@@ -25,7 +25,8 @@ namespace PhotoMusicViewer.Services
     /// Скользящий PCM-кэш на диске ограничен 64 МиБ и удаляется при закрытии.
     /// Перемотка внутри кэша — чтение из кэша. Вне кэша (назад дальше 64 МиБ или далеко
     /// вперёд) источник переходит к нужной странице Ogg по индексу, собранному при
-    /// открытии, и декодирует только 80 мс разгона перед целевой точкой — как libopusfile.
+    /// открытии, и декодирует разгон перед целевой точкой. Для MP4 — индекс пакетов,
+    /// разгон минимум 200 мс. Ogg/MP4 выбирается по содержимому, не по расширению.
     /// Раньше перемотка назад за пределы кэша декодировала запись с самого начала,
     /// что для многочасовых аудиокниг занимало минуты. Полная длительность не урезается.
     /// </summary>
@@ -54,7 +55,20 @@ namespace PhotoMusicViewer.Services
         /// Также передаётся исключением в NAudio -> PlaybackStopped -> PlaybackError.</summary>
         public event Action<Exception>? DecodeFailed;
 
-        public OpusFileReader(string path) : this(() => new OpusPacketSource(path), MaxCacheBytes) { }
+        public OpusFileReader(string path) : this(() => OpenPacketSource(path), MaxCacheBytes) { }
+
+        private static IOpusPacketSource OpenPacketSource(string path)
+        {
+            var format = AudioFormatProbe.Read(path);
+            if (format.Codec != AudioCodec.Opus)
+                throw new InvalidDataException("The file does not contain a supported Opus stream.");
+            return format.Container switch
+            {
+                AudioContainer.Ogg => new OpusPacketSource(path),
+                AudioContainer.Mp4 => new Mp4OpusPacketSource(path),
+                _ => throw new NotSupportedException("Unsupported Opus container.")
+            };
+        }
 
         internal OpusFileReader(Func<IOpusPacketSource> openSource, long cacheCapacity)
         {
