@@ -10,7 +10,7 @@ namespace PhotoMusicViewer.Services
     /// </summary>
     public static class AppInfo
     {
-        public const string GitHubUrl = "https://github.com/re-quies/fastcollageforwin";
+        public const string GitHubUrl = "https://github.com/re-quies/PhotoMusicViewer";
 
         private static readonly Lazy<string> _version = new(() => ReadVersion(Assembly.GetEntryAssembly() ?? typeof(AppInfo).Assembly));
 
