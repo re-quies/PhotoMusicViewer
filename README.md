@@ -2,7 +2,7 @@
 
 A photo viewer and music player for Windows, with local OCR and optional online translation — in one window.
 
-**Version: 3 (7.7.0)** · C# / .NET 8 / WPF
+**Version: 5 ** · C# / .NET 8 / WPF
 
 **Read this in:** [English](#english) · [Русский](#русский) · [Español](#español)
 
