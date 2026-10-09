@@ -94,8 +94,6 @@ namespace PhotoMusicViewer.Services
 
         public event Action<string>? PlaybackError;
 
-        /// <summary>Некритичные уведомления (например, очень длинная Opus-запись загружена не целиком).</summary>
-        public event Action<string>? PlaybackNotice;
 
 /// <summary>NAudio: true после инициализации. MediaPlayer: true означает,
 /// что Open принят; готовность/ошибка приходят асинхронно через события.</summary>

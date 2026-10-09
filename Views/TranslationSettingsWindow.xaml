@@ -48,6 +48,10 @@
             <Setter Property="FontSize" Value="11"/>
             <Setter Property="Margin" Value="0,3,0,0"/>
         </Style>
+        <DataTemplate x:Key="LanguageItemTemplate">
+    <TextBlock Text="{Binding Display}"
+               Foreground="#FF000000"/>
+</DataTemplate>
     </Window.Resources>
 
     <Grid Margin="16">
@@ -170,12 +174,16 @@
 
                     <StackPanel Grid.Column="0">
                         <TextBlock x:Name="TargetLangLabel" Text="Translate into" Style="{StaticResource FieldLabel}"/>
-                        <ComboBox x:Name="TargetLangCombo"/>
+                        <ComboBox x:Name="TargetLangCombo"
+          Foreground="#FF000000"
+          ItemTemplate="{StaticResource LanguageItemTemplate}"/>
                     </StackPanel>
 
                     <StackPanel Grid.Column="2">
                         <TextBlock x:Name="SourceLangLabel" Text="Source language" Style="{StaticResource FieldLabel}"/>
-                        <ComboBox x:Name="SourceLangCombo"/>
+                        <ComboBox x:Name="SourceLangCombo"
+          Foreground="#FF000000"
+          ItemTemplate="{StaticResource LanguageItemTemplate}"/>
                     </StackPanel>
                 </Grid>
 

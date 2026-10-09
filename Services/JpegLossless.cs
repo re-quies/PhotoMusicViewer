@@ -19,10 +19,7 @@ namespace PhotoMusicViewer.Services
         internal static bool IsJpeg(string path) => Path.GetExtension(path).ToLowerInvariant() is ".jpg" or ".jpeg" or ".jfif";
         internal static int Compose(int orientation, int degrees)
         {
-            if (degrees % 90 != 0 || orientation is < 1 or > 8) throw new ArgumentException("Right-angle rotation required.");
-            int[] cw = { 0, 6, 7, 8, 5, 2, 3, 4, 1 };
-            for (int i = 0; i < ((degrees % 360 + 360) % 360) / 90; ++i) orientation = cw[orientation];
-            return orientation;
+            return new ImageViewTransformState(degrees).ComposeOrientation(orientation);
         }
         // Streaming header parser. Metadata payloads never exceed JPEG's 64KiB marker limit.
         internal static Header ReadHeader(Stream source)
@@ -157,11 +154,14 @@ namespace PhotoMusicViewer.Services
             if (!Convert.ToHexString(SHA256.HashData(stream)).Equals(expected, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Bundled JPEG tool checksum mismatch. Reinstall the original tools folder.");
         }
-        internal static void Transform(string path, Stream destination, int degrees, bool strip, CancellationToken token, string? testHelper = null)
+        internal static void Transform(string path, Stream destination, int degrees, bool strip, CancellationToken token, string? testHelper = null) =>
+            Transform(path, destination, new ImageViewTransformState(degrees), strip, token, testHelper);
+
+        internal static void Transform(string path, Stream destination, ImageViewTransformState viewTransform, bool strip, CancellationToken token, string? testHelper = null)
         {
             using var lockedSource = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             ImageSafetyPolicy.ValidateFileLength(lockedSource.Length);
-            Header h = ReadHeader(lockedSource); int transform = Compose(h.Orientation, degrees);
+            Header h = ReadHeader(lockedSource); int transform = viewTransform.ComposeOrientation(h.Orientation);
             var args = new List<string> { "-copy", strip ? "none" : "all", "-perfect", "-maxmemory", "2097152k" };
             string[] options = transform switch
             {

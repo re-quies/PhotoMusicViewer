@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -107,6 +107,7 @@ private sealed class ThumbnailRow
 
 private void OpenThumbnailGrid()
 {
+    CancelMirrorButtonGesture();
     if (_fileOperation != null) return;
     string? currentFolder = _currentIndex >= 0 && _currentIndex < _folderFiles.Count
         ? Path.GetDirectoryName(_folderFiles[_currentIndex]) : _gridCurrentFolder;
@@ -213,7 +214,7 @@ private async Task LoadGridFolderAsync(string folderPath)
 
     // Первый раз шаблон ещё не построен и высота окна неизвестна -
     // повторяем позиционирование после компоновки
-    Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded,
+    _ = Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded,
         new Action(() =>
         {
             if (generation != _gridGeneration) return;
@@ -596,7 +597,7 @@ private void UpdateThumbnailItemSize()
             _applyingSortPreference = true;
             try { SortModeCombo.SelectedIndex = (int)_sortMode; }
             finally { _applyingSortPreference = false; }
-            SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+            RefreshSortDirectionIcon();
             return true;
         }
         private long _currentFileSizeBytes;
@@ -634,6 +635,8 @@ private void UpdateThumbnailItemSize()
     InitializeComponent();
     _openButtonTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background, Dispatcher);
     _openButtonTimer.Tick += OpenButtonSingleTick;
+    _mirrorButtonTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background, Dispatcher);
+    _mirrorButtonTimer.Tick += MirrorButtonSingleTick;
     Unloaded += (_, _) => CancelOpenButtonGesture();
 
     // Потолок декодирования по размеру экрана: с запасом на зум и HiDPI,
@@ -663,7 +666,7 @@ private void UpdateThumbnailItemSize()
         // Только если сортировку в настройках действительно поменяли: иначе OK в окне
         // настроек сбрасывал бы временный выбор на панели (при выключенном запоминании).
         if (_fileOperation != null || !ApplySortPreference(onlyIfChanged: true)) return;
-        if (_folderFiles.Count > 0) ReapplySort();
+        if (_sortUiReady) ReapplySort();
     };
 
     Loaded += (_, _) =>
@@ -933,11 +936,12 @@ private static long SafeFileLength(string path)
 }
         private void ShowCurrent()
         {
+            CancelMirrorButtonGesture();
             if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
 
             var path = _folderFiles[_currentIndex];
             if (!string.Equals(_viewRotationPath, path, StringComparison.OrdinalIgnoreCase))
-            { _viewRotationDegrees = 0; _viewRotationPath = path; }
+            { _viewRotationDegrees = 0; _viewReflected = false; _viewRotationPath = path; }
             _viewBase = null;
             UpdateOperationControls();
 
@@ -997,13 +1001,14 @@ private static long SafeFileLength(string path)
             MainImage.Source = shown;
             _displayPixelWidth = shown.PixelWidth;
             _currentFileSizeBytes = decoded.SizeBytes;
-            bool swap = _viewRotationDegrees is 90 or 270;
+            bool swap = CurrentViewTransform.SwapsDimensions;
             _currentWidth = swap ? decoded.NaturalHeight : decoded.NaturalWidth;
             _currentHeight = swap ? decoded.NaturalWidth : decoded.NaturalHeight;
             RefreshRotationUi();
 
             UpdateGifButtonVisibility();
             RefreshFileLabels(path);
+            UpdateZoomText();
         }
 
 /// <summary>
@@ -1051,7 +1056,7 @@ private async Task LoadGifAsync(string path, int generation, CancellationToken t
 
         _gifAnimator = animator;
         _gifAnimator.Start();
-        GifPlayPauseButton.Content = "\u2759\u2759";
+        RefreshGifPlaybackIcon();
 
         // Для координат обрезки и метаданных нужны исходные размеры,
         // а для качества масштабирования — размеры показанной копии.
@@ -1114,10 +1119,11 @@ private void MaybeUpgradeToFullResolution(double scale)
     if (_gifAnimator != null) return;
     if (_currentIndex < 0 || _currentIndex >= _folderFiles.Count) return;
     if (_displayPixelWidth <= 0 || _currentWidth <= _displayPixelWidth) return;
-    if (MainImage.ActualWidth <= 0) return;
+    double renderedWidth = GetRenderedImageWidthDip() * VisualTreeHelper.GetDpi(MainImage).DpiScaleX;
+    if (renderedWidth <= 0) return;
 
     // Запас 5%: не дёргаемся на границе
-    if (MainImage.ActualWidth * scale <= _displayPixelWidth * 1.05) return;
+    if (renderedWidth * scale <= _displayPixelWidth * 1.05) return;
 
     _fullResRequested = true;
     // Для 100+ Мп и широких панорам «полный размер» для экрана ограничен стороной
@@ -1220,7 +1226,7 @@ private void GoToLast()
 private void ResetCurrentImageState()
 {
     ++_showGeneration;
-    _viewRotationDegrees = 0; _viewRotationPath = null; _viewBase = null;
+    _viewRotationDegrees = 0; _viewReflected = false; _viewRotationPath = null; _viewBase = null;
     RefreshRotationUi();
     CancelPrefetch();
     _imageLoadCts?.Cancel();
@@ -1244,7 +1250,7 @@ private void ResetCurrentImageState()
     _currentFileSizeBytes = 0;
     _fullResRequested = false;
     _currentIndex = -1;
-    OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+    RefreshOcrIcon();
     OcrButton.IsEnabled = true;
     GifPlayPauseButton.Visibility = Visibility.Collapsed;
     ConvertToJpgButton.Visibility = Visibility.Collapsed;
@@ -1357,7 +1363,7 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
     }
 }
 
-        // --- Зум колесом мыши + сброс по ПКМ ---
+        // --- Зум колесом мыши + сброс средней кнопкой ---
 
         private void PhotoView_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
 {
@@ -1373,9 +1379,11 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
     if (FileNameEditBox.Visibility == Visibility.Visible) return;
     if (_currentIndex < 0) return;
 
+    double fitPixelScale = GetFitPixelScale();
+    if (fitPixelScale <= 0) return;
     double oldScale = ImageScaleTransform.ScaleX;
     double factor = e.Delta > 0 ? 1.1 : 0.9;
-    double newScale = Math.Clamp(oldScale * factor, 0.2, 10);
+    double newScale = ImagePixelZoom.ClampWheelScale(oldScale * factor, oldScale, fitPixelScale);
 
     if (Math.Abs(newScale - oldScale) < 0.0001)
     {
@@ -1466,10 +1474,54 @@ if (FileNameEditBox.Visibility == Visibility.Visible)
             UpdateZoomText();
         }
 
+        private void ZoomText_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (_isCropMode || _fileOperation != null || _currentIndex < 0 ||
+                ThumbnailOverlay.Visibility == Visibility.Visible ||
+                FileNameEditBox.Visibility == Visibility.Visible) return;
+            double scale = ImagePixelZoom.OneToOneRelativeScale(GetFitPixelScale());
+            if (scale <= 0) return;
+
+            // Exact physical 1:1, independently of the fitted opening size.
+            // Do not clamp to the wheel's fitted-relative minimum: small images
+            // must also be able to reach their true original pixel size.
+            ImageScaleTransform.ScaleX = scale;
+            ImageScaleTransform.ScaleY = scale;
+            ImageTranslateTransform.X = 0;
+            ImageTranslateTransform.Y = 0;
+            UpdateZoomText();
+            MaybeUpgradeToFullResolution(scale);
+            e.Handled = true;
+        }
+
+        private double GetRenderedImageWidthDip()
+        {
+            if (MainImage.Source is not BitmapSource source) return 0;
+            return ImagePixelZoom.RenderedWidth(MainImage.ActualWidth, MainImage.ActualHeight,
+                source.Width, source.Height);
+        }
+
+        private double GetFitPixelScale()
+        {
+            if (MainImage.Source == null || _currentWidth <= 0) return 0;
+            return ImagePixelZoom.FitPixelScale(GetRenderedImageWidthDip(), _currentWidth,
+                VisualTreeHelper.GetDpi(MainImage).DpiScaleX);
+        }
+
+        private void MainImage_LayoutUpdated(object? sender, EventArgs e)
+        {
+            // Recalculate after decoding, resize, fullscreen, rotation, and
+            // monitor DPI changes. No transform is changed by this event.
+            UpdateZoomText();
+        }
+
         private void UpdateZoomText()
         {
-            int percent = (int)Math.Round(ImageScaleTransform.ScaleX * 100);
-            ZoomText.Text = $"{percent}%";
+            double fitPixelScale = GetFitPixelScale();
+            string text = fitPixelScale > 0
+                ? $"{fitPixelScale * ImageScaleTransform.ScaleX * 100:0.##}%"
+                : "—";
+            if (ZoomText != null && ZoomText.Text != text) ZoomText.Text = text;
         }
 
         // --- Панорамирование ---
@@ -1552,17 +1604,18 @@ private void StartImageDrag()
             if (_gifAnimator.IsPlaying)
             {
                 _gifAnimator.Pause();
-                GifPlayPauseButton.Content = "\u25B6";
+                RefreshGifPlaybackIcon();
             }
             else
             {
                 _gifAnimator.Start();
-                GifPlayPauseButton.Content = "\u2759\u2759";
+                RefreshGifPlaybackIcon();
             }
         }
 
         private void UpdateGifButtonVisibility()
         {
+            MirrorButton.IsEnabled = CanMirror;
             GifPlayPauseButton.Visibility = (_gifAnimator != null && !_isFullscreen)
                 ? Visibility.Visible
                 : Visibility.Collapsed;
@@ -1572,7 +1625,7 @@ private void StartImageDrag()
 
         private async void OcrButton_Click(object sender, RoutedEventArgs e)
         {
-    if (_fileOperation != null || _viewRotationDegrees != 0) return;
+    if (_fileOperation != null || HasViewTransform) return;
             if (_currentIndex < 0) return;
             var path = _folderFiles[_currentIndex];
 
@@ -1584,7 +1637,7 @@ private void StartImageDrag()
             int ocrGeneration = _showGeneration;
 
             OcrButton.IsEnabled = false;
-            OcrButton.Content = Loc.T("Scanning...", "Распознавание...", "Reconociendo...");
+            RefreshOcrIcon();
 
             try
             {
@@ -1636,7 +1689,7 @@ private void StartImageDrag()
                 if (ReferenceEquals(_ocrCts, ocrCts))
                 {
                     _ocrCts = null;
-                    OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+                    RefreshOcrIcon();
                     OcrButton.IsEnabled = true;
                 }
                 ocrCts.Dispose();
@@ -1651,6 +1704,7 @@ private void StartImageDrag()
         private async Task RunFileOperationAsync(string title, Func<FileOperationContext, Task> body)
         {
             if (_fileOperation != null) return;
+            CancelMirrorButtonGesture();
             var operation = new FileOperationContext();
             _fileOperation = operation;
             _operationOwner = Window.GetWindow(this);
@@ -1661,7 +1715,7 @@ private void StartImageDrag()
             _imageLoadCts?.Cancel();
             _ocrCts?.Cancel();
             _ocrCts = null;
-            OcrButton.Content = Loc.T("Scan text", "Распознать текст", "Reconocer texto");
+            RefreshOcrIcon();
             _thumbnailLoadCts?.Cancel();
             OperationStatusPanel.Visibility = Visibility.Visible;
             UpdateOperationControls();
@@ -1712,7 +1766,7 @@ private void StartImageDrag()
             FileNameDisplay.IsHitTestVisible = available;
             if (!available)
             {
-                foreach (var control in new Control[] { OpenButton, PrevButton, NextButton, RotateButton,
+                foreach (var control in new Control[] { OpenButton, PrevButton, NextButton, RotateButton, MirrorButton,
                     ConvertToJpgButton, StripExifButton, BatchRenameButton, DeleteButton, GridViewButton,
                     SortModeCombo, SortDirectionButton, FileNameEditBox }) control.IsEnabled = false;
             }
@@ -1742,7 +1796,7 @@ private void StartImageDrag()
                 stage = Loc.T("Finishing before closing: ", "Завершение перед выходом: ", "Finalizando antes de cerrar: ") + stage;
             OperationStatusText.Text = _operationTitle + " — " + stage +
                 (progress.Total > 0 ? $" ({progress.Processed}/{progress.Total})" : "");
-            CancelOperationButton.Content = Loc.T("Cancel", "Отменить", "Cancelar");
+            SetPhotoButtonLabel(CancelOperationButton, Loc.T("Cancel", "Отменить", "Cancelar"));
             CancelOperationButton.IsEnabled = progress.CanCancel && !_fileOperation.Token.IsCancellationRequested;
         }
         private void CancelOperationButton_Click(object sender, RoutedEventArgs e)
@@ -1769,58 +1823,65 @@ private void StartImageDrag()
         private void RotateButton_Click(object sender, RoutedEventArgs e) => RotateCurrent();
 
         private int _viewRotationDegrees;
+        private bool _viewReflected;
+        private ImageViewTransformState CurrentViewTransform => new(_viewRotationDegrees, _viewReflected);
+        private bool HasViewTransform => !CurrentViewTransform.IsIdentity;
         private string? _viewRotationPath;
         private DecodedImage? _viewBase;
         private BitmapSource WithViewRotation(BitmapSource image)
         {
-            if (_viewRotationDegrees == 0) return image;
-            var result = new TransformedBitmap(image, new RotateTransform(_viewRotationDegrees));
-            if (result.CanFreeze) result.Freeze();
-            return result;
+            return ImageViewTransform.Apply(image, CurrentViewTransform);
         }
         private void RefreshRotationUi()
         {
-            SaveRotationButton.Content = Loc.T("Save rotation", "Сохранить поворот", "Guardar giro");
-            RestoreOriginalButton.Content = Loc.T("Restore original", "Вернуть оригинал", "Restaurar original");
+            SetPhotoButtonLabel(SaveRotationButton, _viewReflected ? Loc.T("Save changes", "Сохранить изменения", "Guardar cambios") : Loc.T("Save rotation", "Сохранить поворот", "Guardar giro"));
+            SetPhotoButtonLabel(MirrorButton, Loc.T("Mirror view", "Зеркальное отражение", "Reflejar vista"),
+                Loc.T("Click: reflect horizontally. Double-click: reflect vertically. View only — the file is unchanged until you save changes.",
+                    "Щелчок — отражение по горизонтали. Двойной щелчок — по вертикали. Только просмотр: файл не меняется до сохранения изменений.",
+                    "Clic: reflejar horizontalmente. Doble clic: verticalmente. Solo vista: el archivo no cambia hasta guardar."));
+            MirrorButton.IsEnabled = CanMirror;
+            SetPhotoButtonLabel(RestoreOriginalButton, Loc.T("Restore original", "Вернуть оригинал", "Restaurar original"));
             bool idle = _fileOperation == null && !_isCropMode;
-            SaveRotationButton.Visibility = _viewRotationDegrees != 0 ? Visibility.Visible : Visibility.Collapsed;
+            SaveRotationButton.Visibility = HasViewTransform ? Visibility.Visible : Visibility.Collapsed;
             SaveRotationButton.IsEnabled = idle;
             string? path = _currentIndex >= 0 && _currentIndex < _folderFiles.Count ? _folderFiles[_currentIndex] : null;
-            DiscardBackupButton.Content = Loc.T("Delete backup", "Удалить резервную копию", "Eliminar copia");
-            DiscardBackupButton.ToolTip = Loc.T("Keep the changes and move the backup of the original to the Recycle Bin",
-                "Оставить изменения, а копию оригинала переместить в корзину", "Conservar los cambios y mover la copia del original a la papelera");
+            SetPhotoButtonLabel(DiscardBackupButton, Loc.T("Delete backup", "Удалить резервную копию", "Eliminar copia"), Loc.T("Keep the changes and move the backup of the original to the Recycle Bin",
+                "Оставить изменения, а копию оригинала переместить в корзину", "Conservar los cambios y mover la copia del original a la papelera"));
             bool hasBackup = path != null && ImageSaveWriter.HasBackup(path);
             RestoreOriginalButton.Visibility = hasBackup ? Visibility.Visible : Visibility.Collapsed;
             RestoreOriginalButton.IsEnabled = idle;
             DiscardBackupButton.Visibility = RestoreOriginalButton.Visibility;
             DiscardBackupButton.IsEnabled = idle;
             RotationActionsPanel.Visibility = SaveRotationButton.Visibility == Visibility.Visible || hasBackup ? Visibility.Visible : Visibility.Collapsed;
-            if (_viewRotationDegrees != 0) { CropButton.IsEnabled = false; OcrButton.IsEnabled = false; StripExifButton.IsEnabled = false; }
+            if (HasViewTransform) { CropButton.IsEnabled = false; OcrButton.IsEnabled = false; StripExifButton.IsEnabled = false; }
         }
         private void RotateCurrent()
         {
             if (_fileOperation != null || _isCropMode || _currentIndex < 0 || _viewBase == null || _gifAnimator != null) return;
-            _viewRotationDegrees = (_viewRotationDegrees + 90) % 360;
+            CancelMirrorButtonGesture();
+            var next = CurrentViewTransform.RotateRight();
+            _viewRotationDegrees = next.Degrees; _viewReflected = next.Reflected;
             ApplyDecodedImage(_viewBase, _folderFiles[_currentIndex]);
             ResetTransform();
             UpdateOperationControls();
         }
         private void SaveRotationButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_fileOperation != null || _currentIndex < 0 || _viewRotationDegrees == 0) return;
-            string path = _folderFiles[_currentIndex]; int degrees = _viewRotationDegrees;
+            if (_fileOperation != null || _currentIndex < 0 || !HasViewTransform) return;
+            CancelMirrorButtonGesture();
+            string path = _folderFiles[_currentIndex]; var transform = CurrentViewTransform;
             var options = new ImageSaveOptionsWindow(Window.GetWindow(this), path, strip: false);
             if (options.ShowDialog() != true) return;
             bool saveCopy = options.Copy, reencode = options.Reencode;
-            _ = RunFileOperationAsync(Loc.T("Save rotation", "Сохранение поворота", "Guardar giro"), async operation =>
+            _ = RunFileOperationAsync(Loc.T("Save changes", "Сохранение изменений", "Guardar cambios"), async operation =>
             {
-                string saved = await BackgroundFileWorker.Run(() => RotateAndSaveService.SaveRotation(path, degrees, saveCopy, reencode, operation));
+                string saved = await BackgroundFileWorker.Run(() => RotateAndSaveService.SaveViewTransform(path, transform, saveCopy, reencode, operation));
                 CompleteImageSave(saved);
             });
         }
         private void CompleteImageSave(string saved)
         {
-            _viewRotationDegrees = 0; _viewRotationPath = saved; _viewBase = null;
+            _viewRotationDegrees = 0; _viewReflected = false; _viewRotationPath = saved; _viewBase = null;
             if (!_folderFiles.Contains(saved, StringComparer.OrdinalIgnoreCase)) _folderFiles.Add(saved);
             _currentIndex = _folderFiles.FindIndex(f => string.Equals(f, saved, StringComparison.OrdinalIgnoreCase));
         }
@@ -1829,9 +1890,9 @@ private void StartImageDrag()
             if (_fileOperation != null || _currentIndex < 0) return;
             string path = _folderFiles[_currentIndex];
             if (MessageBox.Show(Window.GetWindow(this), Loc.T(
-                    "Restore the exact original from the backup next to the photo? Unsaved view rotation is discarded. If the file was changed by another program after editing, automatic restore is refused.\n\nAfterwards the backups that are no longer needed (and the undone edit) are moved to the Recycle Bin.",
-                    "Вернуть точные байты оригинала из резервной копии рядом с фото? Несохранённый поворот будет сброшен. Если после правки файл изменила другая программа, автоматическое восстановление отклоняется.\n\nПосле этого ненужные резервные копии (и отменённая правка) перемещаются в корзину.",
-                    "¿Restaurar el original exacto desde la copia junto a la foto? Se descarta el giro no guardado. Si otro programa cambió el archivo, se rechaza.\n\nDespués, las copias innecesarias (y la edición deshecha) van a la papelera."),
+                    "Restore the exact original from the backup next to the photo? Unsaved rotation/reflection is discarded. If the file was changed by another program after editing, automatic restore is refused.\n\nAfterwards the backups that are no longer needed (and the undone edit) are moved to the Recycle Bin.",
+                    "Вернуть точные байты оригинала из резервной копии рядом с фото? Несохранённый поворот и отражение будут сброшены. Если после правки файл изменила другая программа, автоматическое восстановление отклоняется.\n\nПосле этого ненужные резервные копии (и отменённая правка) перемещаются в корзину.",
+                    "¿Restaurar el original exacto desde la copia junto a la foto? Se descartan el giro y el reflejo no guardados. Si otro programa cambió el archivo, se rechaza.\n\nDespués, las copias innecesarias (y la edición deshecha) van a la papelera."),
                     "PhotoMusicViewer", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
             _ = RunFileOperationAsync(Loc.T("Restore original", "Восстановление оригинала", "Restaurar original"), async operation =>
             {
@@ -2303,7 +2364,6 @@ private void CommitRename()
 
         // --- Локализация (EN/RU) ---
 
-        private void LangButton_Click(object sender, RoutedEventArgs e) => Loc.Toggle();
 
         /// <summary>Открывает меню настроек перевода (ключи API, модель, промты, языки).</summary>
         private void TranslateSettingsButton_Click(object sender, RoutedEventArgs e)
@@ -2314,31 +2374,38 @@ private void CommitRename()
 
         private void ApplyLocalization()
         {
-            LangButton.Content = Loc.Code;
-
-            PhotoModeToggleBtn.Content = Loc.T("Photo", "Фото", "Foto");
-            MusicModeToggleBtn.Content = Loc.T("Music", "Музыка", "Música");
-            OpenButton.Content = Loc.T("Open", "Открыть", "Abrir");
-            OpenButton.ToolTip = Loc.T("Click: open an image. Double-click: open a folder.", "Щелчок — открыть фото. Двойной щелчок — открыть папку.", "Clic: abrir imagen. Doble clic: abrir carpeta.");
+            SetPhotoButtonLabel(PhotoModeToggleBtn, Loc.T("Photo", "Фото", "Foto"));
+            SetPhotoButtonLabel(MusicModeToggleBtn, Loc.T("Music", "Музыка", "Música"));
+            SetPhotoButtonLabel(OpenButton, Loc.T("Open", "Открыть", "Abrir"),
+                Loc.T("Click: open an image. Double-click: open a folder.", "Щелчок — открыть фото. Двойной щелчок — открыть папку.", "Clic: abrir imagen. Doble clic: abrir carpeta."));
             UpdateGridFolderStatus();
-            RotateButton.Content = Loc.T("Rotate view", "Повернуть вид", "Girar vista");
-            RotateButton.ToolTip = Loc.T("View only — the file is unchanged. Use Save rotation to write a copy.", "Только просмотр — файл не меняется. Для записи используйте «Сохранить поворот».", "Solo vista: archivo sin cambios. Use Guardar giro para crear copia.");
+            SetPhotoButtonLabel(RotateButton, Loc.T("Rotate view", "Повернуть вид", "Girar vista"),
+                Loc.T("View only — the file is unchanged. Use Save changes to write a copy.", "Только просмотр — файл не меняется. Для записи используйте кнопку сохранения изменений.", "Solo vista: archivo sin cambios. Use Guardar cambios para crear copia."));
             RefreshRotationUi();
-            CropButton.Content = _isCropMode
-                ? Loc.T("Cancel crop", "Отменить обрезку", "Cancelar recorte")
-                : Loc.T("Crop", "Обрезать", "Recortar");
-            OcrButton.Content = OcrButton.IsEnabled
-                ? Loc.T("Scan text", "Распознать текст", "Reconocer texto")
-                : Loc.T("Scanning...", "Распознавание...", "Reconociendo...");
-            StripExifButton.Content = Loc.T("Strip EXIF", "Убрать EXIF", "Quitar EXIF");
-            BatchRenameButton.Content = Loc.T("Rename all", "Переименовать все", "Renombrar todo");
-            DeleteButton.Content = Loc.T("Delete", "Удалить", "Eliminar");
-            ConvertToJpgButton.Content = Loc.T("Convert to JPG", "В JPG", "A JPG");
-            GridViewButton.Content = Loc.T("Grid", "Сетка", "Cuadrícula");
-            FullscreenButton.Content = Loc.T("Fullscreen", "Во весь экран", "Pantalla completa");
-            TranslateSettingsButton.Content = Loc.T("Settings…", "Настройки…", "Ajustes…");
-            CropSaveButton.Content = Loc.T("Save", "Сохранить", "Guardar");
-            CropCancelButton.Content = Loc.T("Cancel", "Отмена", "Cancelar");
+            RefreshCropIcon();
+            RefreshOcrIcon();
+            RefreshFullscreenIcon();
+            RefreshSortDirectionIcon();
+            RefreshGifPlaybackIcon();
+            SetPhotoButtonLabel(StripExifButton, Loc.T("Strip EXIF", "Убрать EXIF", "Quitar EXIF"));
+            SetPhotoButtonLabel(BatchRenameButton, Loc.T("Rename all", "Переименовать все", "Renombrar todo"));
+            SetPhotoButtonLabel(DeleteButton, Loc.T("Delete", "Удалить", "Eliminar"));
+            SetPhotoButtonLabel(ConvertToJpgButton, Loc.T("Convert to JPG", "В JPG", "A JPG"));
+            SetPhotoButtonLabel(GridViewButton, Loc.T("Grid", "Сетка", "Cuadrícula"));
+            SetPhotoButtonLabel(TranslateSettingsButton, Loc.T("Settings…", "Настройки…", "Ajustes…"));
+            SetPhotoButtonLabel(CropSaveButton, Loc.T("Save", "Сохранить", "Guardar"));
+            SetPhotoButtonLabel(CropCancelButton, Loc.T("Cancel", "Отмена", "Cancelar"));
+            SetPhotoButtonLabel(CancelOperationButton, Loc.T("Cancel", "Отменить", "Cancelar"));
+            SetPhotoButtonLabel(PrevButton, Loc.T("Previous image", "Предыдущее фото", "Imagen anterior"));
+            SetPhotoButtonLabel(NextButton, Loc.T("Next image", "Следующее фото", "Imagen siguiente"));
+            SetPhotoButtonLabel(SortModeCombo, Loc.T("Sort images", "Сортировка фотографий", "Ordenar imágenes"));
+            ZoomText.ToolTip = new ToolTip
+            {
+                FontSize = 13,
+                Content = Loc.T("Click: 100% — one image pixel per screen pixel. Middle click: fit to window.",
+                    "Щелчок — 100%, пиксель в пиксель. Нажатие колёсика — вписать в окно.",
+                    "Clic: 100%, píxel por píxel. Botón central: ajustar a la ventana.")
+            };
 
             SetComboItemText(SortModeCombo, 0, Loc.T("Name", "Имя", "Nombre"));
             SetComboItemText(SortModeCombo, 1, Loc.T("Date modified", "Дата изменения", "Fecha de modificación"));
@@ -2354,6 +2421,57 @@ private void CommitRename()
             }
         }
 
+        private void PhotoToolbarBody_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            // Status belongs to the right-hand group. Keep metadata and zoom
+            // accessible in the filename tooltip at exceptionally small widths.
+            if (PhotoSortPanel == null || FileMetaText == null || ZoomText == null) return;
+            PhotoSortPanel.Visibility = e.NewSize.Width >= 1000 ? Visibility.Visible : Visibility.Collapsed;
+            FileMetaText.MaxWidth = e.NewSize.Width >= 1000 ? 320 : 240;
+            FileMetaText.Visibility = e.NewSize.Width >= 700 ? Visibility.Visible : Visibility.Collapsed;
+            ZoomText.Visibility = e.NewSize.Width >= 700 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void SetPhotoButtonLabel(Control control, string label, string? explanation = null)
+        {
+            string text = string.IsNullOrWhiteSpace(explanation) ? label : label + Environment.NewLine + explanation;
+            control.ToolTip = new ToolTip
+            {
+                Style = (Style)FindResource("PhotoIconToolTipStyle"),
+                Content = new TextBlock { Text = text, Foreground = (Brush)FindResource("ForegroundBrush"), TextWrapping = TextWrapping.Wrap, MaxWidth = 340 }
+            };
+            System.Windows.Automation.AutomationProperties.SetName(control, label);
+            System.Windows.Automation.AutomationProperties.SetHelpText(control, text);
+        }
+        private void SetPhotoIcon(Image image, string name) => image.Source = (ImageSource)FindResource("PhotoIcon." + name);
+        private void RefreshCropIcon()
+        {
+            SetPhotoIcon(CropIcon, _isCropMode ? "Cancel" : "Crop");
+            SetPhotoButtonLabel(CropButton, _isCropMode ? Loc.T("Cancel crop", "Отменить обрезку", "Cancelar recorte") : Loc.T("Crop", "Обрезать", "Recortar"));
+        }
+        private void RefreshOcrIcon()
+        {
+            bool scanning = _ocrCts != null;
+            SetPhotoIcon(OcrIcon, scanning ? "Busy" : "Scan");
+            SetPhotoButtonLabel(OcrButton, scanning ? Loc.T("Scanning...", "Распознавание...", "Reconociendo...") : Loc.T("Scan text", "Распознать текст", "Reconocer texto"));
+        }
+        private void RefreshFullscreenIcon()
+        {
+            SetPhotoIcon(FullscreenIcon, _isFullscreen ? "ExitFullscreen" : "Fullscreen");
+            SetPhotoButtonLabel(FullscreenButton, _isFullscreen ? Loc.T("Exit fullscreen", "Выйти из полного экрана", "Salir de pantalla completa") : Loc.T("Fullscreen", "Во весь экран", "Pantalla completa"));
+        }
+        private void RefreshSortDirectionIcon()
+        {
+            SetPhotoIcon(SortDirectionIcon, _sortDescending ? "SortDown" : "SortUp");
+            SetPhotoButtonLabel(SortDirectionButton, _sortDescending ? Loc.T("Descending", "По убыванию", "Descendente") : Loc.T("Ascending", "По возрастанию", "Ascendente"));
+        }
+        private void RefreshGifPlaybackIcon()
+        {
+            bool playing = _gifAnimator?.IsPlaying == true;
+            SetPhotoIcon(GifPlaybackIcon, playing ? "Pause" : "Play");
+            SetPhotoButtonLabel(GifPlayPauseButton, playing ? Loc.T("Pause GIF", "Пауза GIF", "Pausar GIF") : Loc.T("Play GIF", "Продолжить GIF", "Reproducir GIF"));
+        }
+
         private static void SetComboItemText(ComboBox combo, int index, string text)
         {
             if (index < combo.Items.Count && combo.Items[index] is ComboBoxItem item)
@@ -2362,7 +2480,9 @@ private void CommitRename()
 
         private void ToggleFullscreen()
 {
+    CancelMirrorButtonGesture();
     _isFullscreen = !_isFullscreen;
+    RefreshFullscreenIcon();
     FullscreenRequested?.Invoke(_isFullscreen);
 
     var visibility = _isFullscreen ? Visibility.Collapsed : Visibility.Visible;
@@ -2377,6 +2497,72 @@ private void CommitRename()
         System.Windows.Threading.DispatcherPriority.Input, new Action(() => Focus()));
 }
 
+        // --- Reflection: same click state machine and 150 ms interval as Open. ---
+        private readonly OpenButtonGesture _mirrorButtonGesture = new();
+        private readonly System.Windows.Threading.DispatcherTimer _mirrorButtonTimer;
+        private bool _mirrorMouseActivation;
+        private string? _mirrorTargetPath;
+        private int _mirrorTargetGeneration;
+        private bool CanMirror => _fileOperation == null && !_isCropMode && ThumbnailOverlay.Visibility != Visibility.Visible && _viewBase != null && _gifAnimator == null && _currentIndex >= 0 && _currentIndex < _folderFiles.Count;
+        private void CancelMirrorButtonGesture()
+        {
+            _mirrorButtonTimer?.Stop();
+            _mirrorButtonGesture.Cancel();
+            _mirrorMouseActivation = false;
+            _mirrorTargetPath = null;
+        }
+        private void CaptureMirrorTarget()
+        {
+            _mirrorTargetPath = CanMirror ? _folderFiles[_currentIndex] : null;
+            _mirrorTargetGeneration = _showGeneration;
+        }
+        private void MirrorButton_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (!CanMirror) { CancelMirrorButtonGesture(); e.Handled = true; return; }
+            _mirrorButtonTimer.Stop();
+            if (!_mirrorButtonGesture.SinglePending) CaptureMirrorTarget();
+            _mirrorButtonGesture.MouseDown(e.ClickCount);
+            _mirrorMouseActivation = true;
+        }
+        private void MirrorButton_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!MirrorButton.IsMouseOver) CancelMirrorButtonGesture();
+        }
+        private void MirrorButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!CanMirror) { CancelMirrorButtonGesture(); return; }
+            bool mouse = _mirrorMouseActivation && InputManager.Current.MostRecentInputDevice is MouseDevice;
+            _mirrorMouseActivation = false;
+            _mirrorButtonTimer.Stop();
+            if (!mouse) CaptureMirrorTarget();
+            var action = mouse ? _mirrorButtonGesture.MouseClick() : _mirrorButtonGesture.KeyboardClick();
+            if (_mirrorButtonGesture.SinglePending)
+            {
+                _mirrorButtonTimer.Interval = TimeSpan.FromMilliseconds(OpenButtonGesture.DelayMilliseconds(GetDoubleClickTime()));
+                _mirrorButtonTimer.Start();
+            }
+            else RunMirrorButtonAction(action);
+        }
+        private void MirrorButtonSingleTick(object? sender, EventArgs e)
+        {
+            _mirrorButtonTimer.Stop();
+            var action = _mirrorButtonGesture.SingleExpired();
+            if (!IsLoaded || !IsVisible || Window.GetWindow(this)?.IsActive != true) { CancelMirrorButtonGesture(); return; }
+            RunMirrorButtonAction(action);
+        }
+        private void RunMirrorButtonAction(OpenButtonAction action)
+        {
+            bool sameTarget = CanMirror && _mirrorTargetGeneration == _showGeneration &&
+                string.Equals(_mirrorTargetPath, _folderFiles[_currentIndex], StringComparison.OrdinalIgnoreCase);
+            CancelMirrorButtonGesture();
+            if (!sameTarget || action == OpenButtonAction.None) return;
+            var next = action == OpenButtonAction.Folder ? CurrentViewTransform.ReflectVertical() : CurrentViewTransform.ReflectHorizontal();
+            _viewRotationDegrees = next.Degrees; _viewReflected = next.Reflected;
+            ApplyDecodedImage(_viewBase!, _folderFiles[_currentIndex]);
+            ResetTransform();
+            UpdateOperationControls();
+        }
+
         // --- Открытие файла вручную ---
 
         private readonly OpenButtonGesture _openButtonGesture = new();
@@ -2388,6 +2574,7 @@ private void CommitRename()
 
         private void CancelOpenButtonGesture()
         {
+            CancelMirrorButtonGesture();
             _openButtonTimer.Stop();
             _openButtonGesture.Cancel();
             _openMouseActivation = false;
@@ -2485,7 +2672,7 @@ private void CommitRename()
     };
     if (_sortUiReady) AppPreferences.RememberPhotoSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-    if (_folderFiles.Count > 0) ReapplySort();
+    if (_sortUiReady) ReapplySort();
 }
 
 private void SortDirectionButton_Click(object sender, RoutedEventArgs e)
@@ -2493,10 +2680,38 @@ private void SortDirectionButton_Click(object sender, RoutedEventArgs e)
     if (_fileOperation != null) return;
 
     _sortDescending = !_sortDescending;
-    SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+    RefreshSortDirectionIcon();
     AppPreferences.RememberPhotoSort((FileSortKey)(int)_sortMode, _sortDescending);
 
-    if (_folderFiles.Count > 0) ReapplySort();
+    if (_sortUiReady) ReapplySort();
+}
+
+private void ReapplyGridSort()
+{
+    if (ThumbnailOverlay.Visibility != Visibility.Visible || _gridFolderLoading) return;
+
+    var ordered = ThumbnailGridOrder.Reorder(_thumbnailItems,
+        item => item.Kind == ItemKind.Image, item => item.Path,
+        paths => SortFileSnapshot(paths, _sortMode, _sortDescending, _gridMeta));
+    _visibleThumbnailCts?.Cancel();
+    _thumbnailItems.Clear();
+    foreach (var item in ordered) _thumbnailItems.Add(item);
+    _thumbnailFirstVisibleRow = 0;
+    BuildThumbnailRows();
+    var viewer = _thumbnailScrollViewer ??= FindScrollViewer(ThumbnailItemsControl);
+    viewer?.ScrollToTop();
+    QueueVisibleThumbnails();
+
+    // Refresh visible rows after virtualization has consumed the new ordering.
+    // A folder change/closed grid invalidates this deferred update.
+    int generation = _gridGeneration;
+    _ = Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded,
+        new Action(() =>
+        {
+            if (generation != _gridGeneration || ThumbnailOverlay.Visibility != Visibility.Visible) return;
+            viewer?.ScrollToTop();
+            QueueVisibleThumbnails();
+        }));
 }
 
 private void ReapplySort()
@@ -2517,6 +2732,7 @@ private void ReapplySort()
             RefreshFileLabels(_folderFiles[_currentIndex]);
         }
     }
+    ReapplyGridSort();
 }
 
         // --- Массовое переименование (нумерация) ---
@@ -2660,7 +2876,7 @@ private void ReapplySort()
                     "Удаление метаданных не поддерживается для этого формата.", "No se admite eliminar metadatos en este formato."), "PhotoMusicViewer");
                 return;
             }
-            if (_viewRotationDegrees != 0) return;
+            if (HasViewTransform) return;
             var options = new ImageSaveOptionsWindow(Window.GetWindow(this), path, strip: true);
             if (options.ShowDialog() != true) return;
             bool saveCopy = options.Copy, reencode = options.Reencode;
@@ -2694,7 +2910,7 @@ private void ReapplySort()
 
         private void CropButton_Click(object sender, RoutedEventArgs e)
         {
-    if (_fileOperation != null || _viewRotationDegrees != 0) return;
+    if (_fileOperation != null || HasViewTransform) return;
             if (_isCropMode)
             {
                 ExitCropMode();
@@ -2732,7 +2948,7 @@ private void ReapplySort()
 
             CropOverlay.Visibility = Visibility.Visible;
             CropActionsPanel.Visibility = Visibility.Visible;
-            CropButton.Content = Loc.T("Cancel crop", "Отменить обрезку", "Cancelar recorte");
+            RefreshCropIcon();
             SetCropModeUi(true);
 
             // Ждём завершения layout, чтобы границы изображения были актуальны
@@ -2753,7 +2969,7 @@ private void ReapplySort()
             CropOverlay.Cursor = Cursors.Arrow;
             CropOverlay.Visibility = Visibility.Collapsed;
             CropActionsPanel.Visibility = Visibility.Collapsed;
-            CropButton.Content = Loc.T("Crop", "Обрезать", "Recortar");
+            RefreshCropIcon();
             SetCropModeUi(false);
             Focus();
         }
@@ -2767,6 +2983,7 @@ private void ReapplySort()
             SortDirectionButton.IsEnabled = enabled;
             OpenButton.IsEnabled = enabled;
             RotateButton.IsEnabled = enabled;
+            MirrorButton.IsEnabled = enabled;
             StripExifButton.IsEnabled = enabled;
             BatchRenameButton.IsEnabled = enabled;
             DeleteButton.IsEnabled = enabled;

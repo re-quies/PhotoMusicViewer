@@ -10,12 +10,15 @@ namespace PhotoMusicViewer.Services
         public static void RotateAndSave(string path, int degrees, FileOperationContext? operation = null) =>
             SaveRotation(path, degrees, copy: false, allowReencode: false, operation);
 
-        public static string SaveRotation(string path, int degrees, bool copy = true, bool allowReencode = false, FileOperationContext? operation = null)
+        public static string SaveRotation(string path, int degrees, bool copy = true, bool allowReencode = false, FileOperationContext? operation = null) =>
+            SaveViewTransform(path, new ImageViewTransformState(degrees), copy, allowReencode, operation);
+
+        internal static string SaveViewTransform(string path, ImageViewTransformState transform, bool copy = true, bool allowReencode = false, FileOperationContext? operation = null)
         {
-            if (degrees % 90 != 0) throw new ArgumentException("Right-angle rotation required.");
+            string suffix = transform.Reflected ? "_mirrored" : "_rotated";
             var version = FileVersion.Read(path);
             if (JpegLossless.IsJpeg(path) && !allowReencode)
-                return ImageSaveWriter.Write(path, copy, "_rotated", output => JpegLossless.Transform(path, output, degrees, strip: false, operation?.Token ?? default), operation, version);
+                return ImageSaveWriter.Write(path, copy, suffix, output => JpegLossless.Transform(path, output, transform, strip: false, operation?.Token ?? default), operation, version);
             var ext = Path.GetExtension(path).ToLowerInvariant();
             BitmapEncoder encoder = ext switch
             {
@@ -26,17 +29,12 @@ namespace PhotoMusicViewer.Services
             };
             operation?.Checkpoint(FileOperationStage.Decoding);
             var source = SafeImageDecoder.LoadDecoded(path, 0, rejectMultiPageTiff: true, token: operation?.Token ?? default).Image;
-            var rotated = new TransformedBitmap(source, new System.Windows.Media.RotateTransform(NormalizeDegrees(degrees)));
+            var rotated = ImageViewTransform.Apply(source, transform);
             if (rotated.CanFreeze) rotated.Freeze();
             operation?.Checkpoint(FileOperationStage.Encoding);
             encoder.Frames.Add(BitmapFrame.Create(rotated));
-            return ImageSaveWriter.Write(path, copy, "_rotated", stream => encoder.Save(stream), operation, version);
+            return ImageSaveWriter.Write(path, copy, suffix, stream => encoder.Save(stream), operation, version);
         }
 
-        private static double NormalizeDegrees(int degrees)
-        {
-            int d = degrees % 360;
-            return d < 0 ? d + 360 : d;
-        }
     }
 }

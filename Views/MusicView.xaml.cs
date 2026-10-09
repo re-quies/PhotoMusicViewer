@@ -1,4 +1,4 @@
-using System;
+﻿﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -116,8 +116,6 @@ namespace PhotoMusicViewer.Views
                 TimeText.Text = "00:00 / 00:00";
                 MessageBox.Show(msg, Loc.T("PhotoMusicViewer - Playback Error", "PhotoMusicViewer - ошибка воспроизведения", "PhotoMusicViewer - Error de reproducción"), MessageBoxButton.OK, MessageBoxImage.Error);
             });
-            _player.PlaybackNotice += msg => Dispatcher.Invoke(() =>
-    MessageBox.Show(msg, "PhotoMusicViewer", MessageBoxButton.OK, MessageBoxImage.Information));
 
             Loaded += (_, _) =>
             {
@@ -171,7 +169,7 @@ namespace PhotoMusicViewer.Views
                     _sortMode = (SortMode)(int)prefs.MusicSort;
                     _sortDescending = prefs.MusicSortDescending;
                     SortModeCombo.SelectedIndex = (int)_sortMode;
-                    SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+                    RefreshSortDirectionIcon();
                     if (onlyIfChanged && _tracks.Count > 0) ReapplySort();
                 }
             }
@@ -294,7 +292,7 @@ namespace PhotoMusicViewer.Views
         private void UpdatePlaybackUi()
         {
             // Отложенный запрос Play ещё не означает, что звук воспроизводится.
-            PlayPauseButton.Content = _player.IsPlaying ? "\u23F8" : "\u25B6";
+            SetPlaybackButtonState(_player.IsPlaying);
             MarkPlayingTrack(_player.IsPlaying && _currentIndex >= 0 && _currentIndex < _tracks.Count
                 ? _tracks[_currentIndex] : null);
         }
@@ -311,7 +309,7 @@ namespace PhotoMusicViewer.Views
             _currentIndex = -1;
             MarkPlayingTrack(null);
             NowPlayingText.Text = Loc.T("No track loaded", "Трек не загружен", "Ninguna pista cargada");
-            PlayPauseButton.Content = "\u25B6";
+            SetPlaybackButtonState(false);
             SeekSlider.Value = 0;
             TimeText.Text = "00:00 / 00:00";
         }
@@ -334,7 +332,7 @@ namespace PhotoMusicViewer.Views
             if (_player.IsPlaying || _player.IsPlayPending)
             {
                 _player.Pause();
-                PlayPauseButton.Content = "\u25B6";
+                SetPlaybackButtonState(false);
             }
             else
             {
@@ -378,7 +376,7 @@ namespace PhotoMusicViewer.Views
                 else
                 {
                     _player.Stop();
-                    PlayPauseButton.Content = "\u25B6";
+                    SetPlaybackButtonState(false);
                     return;
                 }
             }
@@ -580,32 +578,37 @@ namespace PhotoMusicViewer.Views
 
         private void UpdateRepeatButtonText()
         {
-            RepeatButton.Content = _repeatMode switch
+            string label = _repeatMode switch
             {
                 RepeatMode.Off => Loc.T("Repeat: Off", "Повтор: выкл", "Repetir: no"),
                 RepeatMode.RepeatAll => Loc.T("Repeat: All", "Повтор: все", "Repetir: todo"),
                 RepeatMode.RepeatOne => Loc.T("Repeat: One", "Повтор: один", "Repetir: uno"),
                 _ => Loc.T("Repeat: Off", "Повтор: выкл", "Repetir: no")
             };
+            SetMusicIcon(RepeatIcon, _repeatMode switch { RepeatMode.RepeatAll => "RepeatAll", RepeatMode.RepeatOne => "RepeatOne", _ => "RepeatOff" });
+            RepeatButton.Tag = _repeatMode == RepeatMode.Off ? null : "Active";
+            SetMusicControlLabel(RepeatButton, label, Loc.T("Click to cycle: off → all → one.", "Щелчок: выкл → все → один.", "Clic: no → todo → uno."));
         }
 
         // --- Локализация (EN/RU) ---
 
-        private void LangButton_Click(object sender, RoutedEventArgs e) => Loc.Toggle();
 
         private void ApplyLocalization()
         {
-            LangButton.Content = Loc.Code;
-
-            PhotoModeToggleBtn.Content = Loc.T("Photo", "Фото", "Foto");
-            MusicModeToggleBtn.Content = Loc.T("Music", "Музыка", "Música");
-            AddFolderButton.Content = Loc.T("Add Folder", "Добавить папку", "Añadir carpeta");
-            ShuffleButton.Content = Loc.T("Shuffle", "Перемешать", "Aleatorio");
-            RemoveTrackButton.Content = Loc.T("Remove", "Убрать", "Quitar");
-            ClearButton.Content = Loc.T("Clear", "Очистить", "Vaciar");
-            SpeedLabel.Text = Loc.T("Speed", "Скорость", "Velocidad");
-            VolLabel.Text = Loc.T("Vol", "Громк.", "Vol.");
-            SpeedText.ToolTip = Loc.T("Click to reset speed to 1.0x", "Клик — сбросить скорость на 1.0x", "Clic — restablecer la velocidad a 1.0x");
+            SetModeButtonLabel(PhotoModeToggleBtn, Loc.T("Photo", "Фото", "Foto"));
+            SetModeButtonLabel(MusicModeToggleBtn, Loc.T("Music", "Музыка", "Música"));
+            SetMusicControlLabel(AddFolderButton, Loc.T("Add Folder", "Добавить папку", "Añadir carpeta"));
+            SetMusicControlLabel(ShuffleButton, Loc.T("Shuffle", "Перемешать", "Aleatorio"), Loc.T("Shuffle the upcoming tracks once; the current track stays in place.", "Однократно перемешать следующие треки; текущий остаётся на месте.", "Mezclar una vez las pistas siguientes; la actual no se mueve."));
+            SetMusicControlLabel(RemoveTrackButton, Loc.T("Remove", "Убрать", "Quitar"), Loc.T("Remove the selected track from the playlist. The file is not deleted.", "Убрать выбранный трек из списка. Файл не удаляется.", "Quitar la pista seleccionada de la lista. No se elimina el archivo."));
+            SetMusicControlLabel(ClearButton, Loc.T("Clear", "Очистить", "Vaciar"), Loc.T("Clear the playlist. Files are not deleted.", "Очистить список воспроизведения. Файлы не удаляются.", "Vaciar la lista. No se eliminan los archivos."));
+            SetMusicControlLabel(PrevTrackButton, Loc.T("Previous track", "Предыдущий трек", "Pista anterior"));
+            SetMusicControlLabel(NextTrackButton, Loc.T("Next track", "Следующий трек", "Pista siguiente"));
+            RefreshSortDirectionIcon();
+            SetPlaybackButtonState(_player.IsPlaying);
+            SetMusicControlLabel(SpeedIndicator, Loc.T("Playback speed", "Скорость воспроизведения", "Velocidad de reproducción"));
+            SetMusicControlLabel(VolumeIndicator, Loc.T("Volume", "Громкость", "Volumen"));
+            SetMusicControlLabel(VolumePercentText, Loc.T("Volume", "Громкость", "Volumen"));
+            SetMusicControlLabel(SpeedText, Loc.T("Playback speed", "Скорость воспроизведения", "Velocidad de reproducción"), Loc.T("Click to reset speed to 1.0x", "Клик — сбросить скорость на 1.0x", "Clic — restablecer la velocidad a 1.0x"));
 
             SetComboItemText(SortModeCombo, 0, Loc.T("Name", "Имя", "Nombre"));
             SetComboItemText(SortModeCombo, 1, Loc.T("Date modified", "Дата изменения", "Fecha de modificación"));
@@ -618,6 +621,96 @@ namespace PhotoMusicViewer.Views
             // Текст-заглушка виден, только пока трек не загружен
             if (_currentIndex < 0)
                 NowPlayingText.Text = Loc.T("No track loaded", "Трек не загружен", "Ninguna pista cargada");
+        }
+
+        private void SetModeButtonLabel(System.Windows.Controls.Primitives.ToggleButton button, string label) => SetMusicControlLabel(button, label);
+
+        private void SetMusicControlLabel(FrameworkElement element, string label, string? explanation = null)
+        {
+            string text = string.IsNullOrWhiteSpace(explanation) ? label : label + Environment.NewLine + explanation;
+            element.ToolTip = new ToolTip
+            {
+                Style = (Style)FindResource("MusicIconToolTipStyle"),
+                Content = new TextBlock { Text = text, FontSize = 13, Foreground = (Brush)FindResource("ForegroundBrush"), TextWrapping = TextWrapping.Wrap, MaxWidth = 360 }
+            };
+            System.Windows.Automation.AutomationProperties.SetName(element, label);
+            System.Windows.Automation.AutomationProperties.SetHelpText(element, text);
+        }
+        private void SetMusicIcon(Image image, string icon) => image.Source = (ImageSource)FindResource("PhotoIcon." + icon);
+        private void SetPlaybackButtonState(bool playing)
+        {
+            SetMusicIcon(MusicPlaybackIcon, playing ? "Pause" : "Play");
+            SetMusicControlLabel(PlayPauseButton, playing ? Loc.T("Pause", "Пауза", "Pausa") : Loc.T("Play", "Воспроизвести", "Reproducir"));
+        }
+        private void RefreshSortDirectionIcon()
+        {
+            SetMusicIcon(MusicSortDirectionIcon, _sortDescending ? "SortDown" : "SortUp");
+            SetMusicControlLabel(SortDirectionButton, _sortDescending ? Loc.T("Descending", "По убыванию", "Descendente") : Loc.T("Ascending", "По возрастанию", "Ascendente"), Loc.T("Click to change sort direction.", "Щелчок — изменить направление сортировки.", "Clic: cambiar el sentido de ordenación."));
+        }
+        private void MusicToolbarBody_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (SortModeCombo != null) SortModeCombo.Visibility = e.NewSize.Width >= 700 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        private void MusicActionViewport_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (MusicDetailsBar == null || MusicActionsPanel == null || AddFolderButton == null) return;
+            double naturalWidth = MusicActionsPanel.ActualWidth;
+            double scale = naturalWidth > 0 ? Math.Min(1, e.NewSize.Width / naturalWidth) : 1;
+            // Match the actual left edge of Add Folder, including its scaled margin;
+            // the right edge reaches the window, not the footer's inner padding.
+            double alignedWidth = Math.Max(0, e.NewSize.Width + BottomBar.Padding.Right - AddFolderButton.Margin.Left * scale);
+            // A single row needs room for two real sliders, icons and values.
+            // Expand left only in compact windows; never shrink the counter/font.
+            double available = MusicPlaylistArea.ActualWidth > 0 ? MusicPlaylistArea.ActualWidth : ActualWidth;
+            MusicDetailsBar.Width = Math.Min(available, Math.Max(320, alignedWidth));
+        }
+        private Rect _playlistClipBounds = Rect.Empty;
+        private Rect _playlistClipNotch = Rect.Empty;
+        private ScrollViewer? _playlistScrollViewer;
+
+        private void MusicPlaylistArea_LayoutUpdated(object? sender, EventArgs e)
+        {
+            if (TrackListBox == null || MusicDetailsBar == null || TrackListBox.ActualWidth <= 0 || TrackListBox.ActualHeight <= 0) return;
+            double width = TrackListBox.ActualWidth, height = TrackListBox.ActualHeight;
+            Point topLeft = MusicDetailsBar.TranslatePoint(new Point(), TrackListBox);
+            double x = Math.Clamp(topLeft.X, 0, width), y = Math.Clamp(topLeft.Y, 0, height);
+            var bounds = new Rect(0, 0, width, height);
+            var notch = new Rect(x, y, Math.Min(MusicDetailsBar.ActualWidth, width - x), Math.Min(MusicDetailsBar.ActualHeight, height - y));
+            if (bounds != _playlistClipBounds || notch != _playlistClipNotch)
+            {
+                // Reserve only the real right-hand controls rectangle. The left
+                // part of the last playlist rows remains drawn and clickable.
+                var clip = new CombinedGeometry(GeometryCombineMode.Exclude, new RectangleGeometry(bounds), new RectangleGeometry(notch));
+                clip.Freeze();
+                TrackListBox.Clip = clip;
+                _playlistClipBounds = bounds;
+                _playlistClipNotch = notch;
+            }
+            // Keep the complete scrollbar track/buttons above the reserved corner;
+            // do not hide the bottom of the native scrollbar behind the controls.
+            if (_playlistScrollViewer == null || !TrackListBox.IsAncestorOf(_playlistScrollViewer))
+                _playlistScrollViewer = FindPlaylistScrollViewer(TrackListBox);
+            if (_playlistScrollViewer is ScrollViewer viewer && viewer.Template?.FindName("PART_VerticalScrollBar", viewer) is System.Windows.Controls.Primitives.ScrollBar bar)
+            {
+                var margin = new Thickness(0, 0, 0, Math.Min(height, MusicDetailsBar.ActualHeight));
+                if (bar.Margin != margin) bar.Margin = margin;
+            }
+        }
+        private static ScrollViewer? FindPlaylistScrollViewer(DependencyObject root)
+        {
+            if (root is ScrollViewer viewer) return viewer;
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+            {
+                var found = FindPlaylistScrollViewer(VisualTreeHelper.GetChild(root, i));
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        private void MusicPlaybackCenter_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (TimeText != null) TimeText.Visibility = e.NewSize.Width >= 130 ? Visibility.Visible : Visibility.Collapsed;
+            // In tiny windows the full time stays in the seek bar tooltip.
         }
 
         private static void SetComboItemText(ComboBox combo, int index, string text)
@@ -648,7 +741,7 @@ namespace PhotoMusicViewer.Views
         private void SortDirectionButton_Click(object sender, RoutedEventArgs e)
         {
             _sortDescending = !_sortDescending;
-            SortDirectionButton.Content = _sortDescending ? "\u2193" : "\u2191";
+            RefreshSortDirectionIcon();
             AppPreferences.RememberMusicSort((FileSortKey)(int)_sortMode, _sortDescending);
 
             if (_tracks.Count > 0) ReapplySort();
@@ -1175,7 +1268,7 @@ namespace PhotoMusicViewer.Views
                 }
                 else
                 {
-                    PlayPauseButton.Content = "\u25B6";
+                    SetPlaybackButtonState(false);
                 }
             }
             catch (Exception ex)

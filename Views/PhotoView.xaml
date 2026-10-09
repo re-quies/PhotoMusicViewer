@@ -1,6 +1,7 @@
 <UserControl x:Class="PhotoMusicViewer.Views.PhotoView"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:services="clr-namespace:PhotoMusicViewer.Services"
              Background="{StaticResource BackgroundBrush}"
              Focusable="True"
              KeyboardNavigation.DirectionalNavigation="None"
@@ -8,6 +9,14 @@
              PreviewMouseDown="PhotoView_PreviewMouseDown"
             PreviewMouseWheel="PhotoView_PreviewMouseWheel">
 
+    <UserControl.Resources>
+        <ResourceDictionary><ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary Source="../Resources/PhotoIcons.xaml"/>
+            <ResourceDictionary Source="../Resources/SortControls.xaml"/>
+        </ResourceDictionary.MergedDictionaries>
+            <services:PhotoActionsWidthConverter x:Key="PhotoActionsWidthConverter"/>
+        </ResourceDictionary>
+    </UserControl.Resources>
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="*"/>
@@ -19,7 +28,7 @@
             <Image x:Name="MainImage" Stretch="Uniform" RenderTransformOrigin="0.5,0.5"
                    MouseLeftButtonDown="MainImage_MouseLeftButtonDown"
                    MouseLeftButtonUp="MainImage_MouseLeftButtonUp"
-                   MouseMove="MainImage_MouseMove">
+                   MouseMove="MainImage_MouseMove" LayoutUpdated="MainImage_LayoutUpdated">
                 <Image.RenderTransform>
                     <TransformGroup>
                         <ScaleTransform x:Name="ImageScaleTransform" ScaleX="1" ScaleY="1"/>
@@ -28,19 +37,22 @@
                 </Image.RenderTransform>
             </Image>
 
-            <Button x:Name="PrevButton" Content="&#8592;" Width="44" Height="44"
-        HorizontalAlignment="Left" VerticalAlignment="Center" Margin="10,0"
-        FontSize="20" Click="PrevButton_Click" Opacity="0.7"
-        Focusable="False" IsTabStop="False"/>
-<Button x:Name="NextButton" Content="&#8594;" Width="44" Height="44"
-        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="10,0"
-        FontSize="20" Click="NextButton_Click" Opacity="0.7"
-        Focusable="False" IsTabStop="False"/>
+            <Button x:Name="PrevButton" Style="{StaticResource PhotoIconButtonStyle}"
+        HorizontalAlignment="Left" VerticalAlignment="Center" Margin="10,0" Click="PrevButton_Click" Opacity="0.7"
+        Focusable="False" IsTabStop="False">
+                <Image Source="{StaticResource PhotoIcon.Previous}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
+<Button x:Name="NextButton" Style="{StaticResource PhotoIconButtonStyle}"
+        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="10,0" Click="NextButton_Click" Opacity="0.7"
+        Focusable="False" IsTabStop="False">
+                <Image Source="{StaticResource PhotoIcon.Next}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
 
-<Button x:Name="GifPlayPauseButton" Content="&#10074;&#10074;" Width="44" Height="44"
-        HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,60"
-        FontSize="16" Click="GifPlayPauseButton_Click" Visibility="Collapsed" Opacity="0.8"
-        Focusable="False" IsTabStop="False"/>
+<Button x:Name="GifPlayPauseButton" Style="{StaticResource PhotoIconButtonStyle}"
+        HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,60" Click="GifPlayPauseButton_Click" Visibility="Collapsed" Opacity="0.8"
+        Focusable="False" IsTabStop="False">
+                <Image x:Name="GifPlaybackIcon" Source="{StaticResource PhotoIcon.Pause}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
 
             <!-- Оверлей обрезки: затемнение, рамка и маркеры создаются в code-behind -->
             <Canvas x:Name="CropOverlay" Background="Transparent" Visibility="Collapsed"
@@ -51,10 +63,14 @@
 
             <StackPanel x:Name="CropActionsPanel" Orientation="Horizontal" Visibility="Collapsed"
                         HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,14">
-                <Button x:Name="CropSaveButton" Content="Save" Width="90" Margin="4,0"
-                        Click="CropSaveButton_Click" Focusable="False" IsTabStop="False"/>
-                <Button x:Name="CropCancelButton" Content="Cancel" Width="90" Margin="4,0"
-                        Click="CropCancelButton_Click" Focusable="False" IsTabStop="False"/>
+                <Button x:Name="CropSaveButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="4,0"
+                        Click="CropSaveButton_Click" Focusable="False" IsTabStop="False">
+                <Image Source="{StaticResource PhotoIcon.Save}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
+                <Button x:Name="CropCancelButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="4,0"
+                        Click="CropCancelButton_Click" Focusable="False" IsTabStop="False">
+                <Image Source="{StaticResource PhotoIcon.Cancel}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
             </StackPanel>
         </Grid>
 <Grid x:Name="ThumbnailOverlay" Grid.Row="0" Background="{StaticResource BackgroundBrush}"
@@ -134,112 +150,105 @@
                 <ProgressBar Width="70" Height="10" IsIndeterminate="True" Margin="0,0,10,0"/>
                 <TextBlock x:Name="OperationStatusText" VerticalAlignment="Center"
                            Foreground="{StaticResource ForegroundBrush}" MaxWidth="520" TextWrapping="Wrap"/>
-                <Button x:Name="CancelOperationButton" Content="Cancel" Margin="12,0,0,0"
-                        Click="CancelOperationButton_Click"/>
+                <Button x:Name="CancelOperationButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="12,0,0,0"
+                        Click="CancelOperationButton_Click">
+                <Image Source="{StaticResource PhotoIcon.Cancel}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
             </StackPanel>
         </Border>
         <!-- Нижняя панель -->
         <StackPanel x:Name="RotationActionsPanel" Grid.Row="0" Orientation="Horizontal"
                     HorizontalAlignment="Right" VerticalAlignment="Top" Margin="8" Panel.ZIndex="30"
                     Background="{StaticResource PanelBrush}" Visibility="Collapsed">
-            <Button x:Name="SaveRotationButton" Content="Save rotation" Margin="4" Padding="8,4"
-                    Click="SaveRotationButton_Click" Visibility="Collapsed" Focusable="False" />
-            <Button x:Name="RestoreOriginalButton" Content="Restore original" Margin="4" Padding="8,4"
-                    Click="RestoreOriginalButton_Click" Visibility="Collapsed" Focusable="False" />
-            <Button x:Name="DiscardBackupButton" Content="Delete backup" Margin="4" Padding="8,4"
-                    Click="DiscardBackupButton_Click" Visibility="Collapsed" Focusable="False" />
+            <Button x:Name="SaveRotationButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="4"
+                    Click="SaveRotationButton_Click" Visibility="Collapsed" Focusable="False" >
+                <Image Source="{StaticResource PhotoIcon.Save}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
+            <Button x:Name="RestoreOriginalButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="4"
+                    Click="RestoreOriginalButton_Click" Visibility="Collapsed" Focusable="False" >
+                <Image Source="{StaticResource PhotoIcon.Restore}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
+            <Button x:Name="DiscardBackupButton" Style="{StaticResource PhotoIconButtonStyle}" Margin="4"
+                    Click="DiscardBackupButton_Click" Visibility="Collapsed" Focusable="False" >
+                <Image Source="{StaticResource PhotoIcon.DiscardBackup}" Width="24" Height="24" IsHitTestVisible="False"/>
+            </Button>
         </StackPanel>
-        <Grid x:Name="BottomBar" Grid.Row="1" Background="{StaticResource PanelBrush}" Height="42">
-    <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="*"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    <ColumnDefinition Width="Auto"/>
-    </Grid.ColumnDefinitions>
-
-    <ToggleButton x:Name="PhotoModeToggleBtn" Content="Photo" Width="70" Grid.Column="0"
-                  IsChecked="True" Margin="4,4" Click="PhotoModeToggleBtn_Click"
-                  Focusable="False" IsTabStop="False"/>
-    <ToggleButton x:Name="MusicModeToggleBtn" Content="Music" Width="70" Grid.Column="1"
-                  Margin="4,4" Click="MusicModeToggleBtn_Click"
-                  Focusable="False" IsTabStop="False"/>
-
-    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0">
-        <Grid>
-            <TextBlock x:Name="FileNameDisplay" VerticalAlignment="Center"
-                       Foreground="{StaticResource ForegroundBrush}"
-                       Text="No file opened" TextTrimming="CharacterEllipsis"
-                       Cursor="IBeam"
-                       MouseLeftButtonDown="FileNameDisplay_MouseLeftButtonDown"/>
-            <TextBox x:Name="FileNameEditBox" VerticalAlignment="Center"
-                     Visibility="Collapsed" BorderThickness="0" Padding="0"
-                     Background="Transparent" Foreground="{StaticResource ForegroundBrush}"
-                     CaretBrush="{StaticResource ForegroundBrush}"
-                     LostFocus="FileNameEditBox_LostFocus"
-                     PreviewKeyDown="FileNameEditBox_PreviewKeyDown"/>
-        </Grid>
-        <TextBlock x:Name="FileMetaText" VerticalAlignment="Center" Margin="8,0,0,0"
-                   Foreground="{StaticResource ForegroundBrush}" Text=""/>
-    </StackPanel>
-
-    <TextBlock x:Name="ZoomText" Grid.Column="3" VerticalAlignment="Center"
-               Margin="10,0" Foreground="{StaticResource ForegroundBrush}"
-               Text="100%"/>
-
-    <ComboBox x:Name="SortModeCombo" Grid.Column="4" Width="110" Margin="4,4"
-              SelectedIndex="1" SelectionChanged="SortModeCombo_SelectionChanged"
-              Focusable="False" IsTabStop="False">
-        <ComboBoxItem Content="Name"/>
-        <ComboBoxItem Content="Date modified"/>
-        <ComboBoxItem Content="Size"/>
-        <ComboBoxItem Content="Type"/>
-    </ComboBox>
-    <Button x:Name="SortDirectionButton" Grid.Column="5" Content="&#8595;" Width="30" Margin="4,4"
-            Click="SortDirectionButton_Click" Focusable="False" IsTabStop="False"/>
-
-    <Button x:Name="OpenButton" Grid.Column="6" Content="Open" Margin="4,4"
-            Click="OpenButton_Click" PreviewMouseLeftButtonDown="OpenButton_PreviewMouseLeftButtonDown"
-            PreviewMouseLeftButtonUp="OpenButton_PreviewMouseLeftButtonUp"
-            Focusable="False" IsTabStop="False"/>
-    <Button x:Name="RotateButton" Grid.Column="7" Content="Rotate" Margin="4,4"
-            Click="RotateButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="CropButton" Grid.Column="8" Content="Crop" Margin="4,4"
-            Click="CropButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="OcrButton" Grid.Column="9" Content="Scan text" Margin="4,4"
-            Click="OcrButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="StripExifButton" Grid.Column="10" Content="Strip EXIF" Margin="4,4"
-            Click="StripExifButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="BatchRenameButton" Grid.Column="11" Content="Rename all" Margin="4,4"
-            Click="BatchRenameButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="DeleteButton" Grid.Column="12" Content="Delete" Margin="4,4"
-            Click="DeleteButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="ConvertToJpgButton" Grid.Column="13" Content="Convert to JPG" Margin="4,4"
-            Click="ConvertToJpgButton_Click" Visibility="Collapsed"
-            Focusable="False" IsTabStop="False"/>
-    <Button x:Name="GridViewButton" Grid.Column="14" Content="Grid" Margin="4,4"
-            Click="GridViewButton_Click" 
-            Focusable="False" IsTabStop="False"/>
-    <Button x:Name="FullscreenButton" Grid.Column="15" Content="Fullscreen" Margin="4,4"
-            Click="FullscreenButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="TranslateSettingsButton" Grid.Column="16" Content="Settings…" Margin="4,4"
-            Click="TranslateSettingsButton_Click" Focusable="False" IsTabStop="False"/>
-    <Button x:Name="LangButton" Grid.Column="17" Content="EN" Width="40" Margin="4,4"
-            ToolTip="Switch language / Переключить язык / Cambiar idioma"
-            Click="LangButton_Click" Focusable="False" IsTabStop="False"/>
-</Grid>
+        <Border x:Name="BottomBar" Grid.Row="1" Background="{StaticResource PanelBrush}" Height="{StaticResource MediaControlPanelHeight}" Padding="0,0,8,0">
+            <Grid x:Name="PhotoToolbarBody" SizeChanged="PhotoToolbarBody_SizeChanged">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel x:Name="PhotoModeSelectors" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <ToggleButton x:Name="PhotoModeToggleBtn" IsChecked="True" Style="{StaticResource MediaModeIconToggleStyle}" Click="PhotoModeToggleBtn_Click">
+                        <Image Source="{StaticResource PhotoIcon.Photo}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </ToggleButton>
+                    <ToggleButton x:Name="MusicModeToggleBtn" Style="{StaticResource MediaModeIconToggleStyle}" Click="MusicModeToggleBtn_Click">
+                        <Image Source="{StaticResource PhotoIcon.Music}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </ToggleButton>
+                </StackPanel>
+                <!-- Only the file name stays on the left; use the unchanged inherited font size. -->
+                <Grid x:Name="PhotoToolbarInfo" Grid.Column="1" Margin="10,0" ClipToBounds="True" VerticalAlignment="Center">
+                    <TextBlock x:Name="FileNameDisplay" Foreground="{StaticResource ForegroundBrush}" Text="No file opened" ToolTip="{Binding Text, ElementName=FileMetaText}" TextTrimming="CharacterEllipsis" Cursor="IBeam" MouseLeftButtonDown="FileNameDisplay_MouseLeftButtonDown" FontSize="13"/>
+                    <TextBox x:Name="FileNameEditBox" Visibility="Collapsed" BorderThickness="0" Padding="0" Background="Transparent" Foreground="{StaticResource ForegroundBrush}" CaretBrush="{StaticResource ForegroundBrush}" LostFocus="FileNameEditBox_LostFocus" PreviewKeyDown="FileNameEditBox_PreviewKeyDown" FontSize="13"/>
+                </Grid>
+                <!-- Right-anchored, single-row actions. Scale DOWN only if the window is exceptionally narrow. -->
+                <Viewbox x:Name="PhotoActionViewport" Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center" Stretch="Uniform" StretchDirection="DownOnly">
+                    <Viewbox.MaxWidth><MultiBinding Converter="{StaticResource PhotoActionsWidthConverter}">
+                        <Binding ElementName="BottomBar" Path="ActualWidth"/>
+                        <Binding ElementName="PhotoModeSelectors" Path="ActualWidth"/>
+                        <Binding ElementName="BottomBar" Path="Padding"/>
+                    </MultiBinding></Viewbox.MaxWidth>
+                    <StackPanel x:Name="PhotoRightGroup" Orientation="Horizontal">
+                        <TextBlock x:Name="FileMetaText" VerticalAlignment="Center" Margin="8,0" MaxWidth="320" Opacity="0.7" Foreground="{StaticResource ForegroundBrush}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" FontSize="13"/>
+                        <TextBlock x:Name="ZoomText" VerticalAlignment="Center" Margin="8,0" Opacity="0.7" Foreground="{StaticResource ForegroundBrush}" Text="—" FontSize="13" Cursor="Hand" MouseLeftButtonDown="ZoomText_MouseLeftButtonDown"/>
+                        <StackPanel x:Name="PhotoSortPanel" Orientation="Horizontal" VerticalAlignment="Center">
+                            <ComboBox x:Name="SortModeCombo" Style="{StaticResource MediaSortComboBoxStyle}" Width="110" Height="32" Margin="2,4" SelectedIndex="1" SelectionChanged="SortModeCombo_SelectionChanged" Focusable="False" IsTabStop="False" FontSize="13">
+                                <ComboBoxItem Content="Name"/><ComboBoxItem Content="Date modified"/>
+                                <ComboBoxItem Content="Size"/><ComboBoxItem Content="Type"/>
+                            </ComboBox>
+                            <Button x:Name="SortDirectionButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="SortDirectionButton_Click">
+                                <Image x:Name="SortDirectionIcon" Source="{StaticResource PhotoIcon.SortDown}" Width="20" Height="20" IsHitTestVisible="False"/>
+                            </Button>
+                        </StackPanel>
+                    <StackPanel x:Name="PhotoActionsPanel" Orientation="Horizontal">
+                    <Button x:Name="OpenButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="OpenButton_Click" PreviewMouseLeftButtonDown="OpenButton_PreviewMouseLeftButtonDown" PreviewMouseLeftButtonUp="OpenButton_PreviewMouseLeftButtonUp">
+                        <Image Source="{StaticResource PhotoIcon.Open}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="GridViewButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="GridViewButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Grid}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="CropButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="CropButton_Click">
+                        <Image x:Name="CropIcon" Source="{StaticResource PhotoIcon.Crop}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="RotateButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="RotateButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Rotate}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="MirrorButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="MirrorButton_Click" PreviewMouseLeftButtonDown="MirrorButton_PreviewMouseLeftButtonDown" PreviewMouseLeftButtonUp="MirrorButton_PreviewMouseLeftButtonUp">
+                        <Image Source="{StaticResource PhotoIcon.Mirror}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="OcrButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="OcrButton_Click">
+                        <Image x:Name="OcrIcon" Source="{StaticResource PhotoIcon.Scan}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="FullscreenButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="FullscreenButton_Click">
+                        <Image x:Name="FullscreenIcon" Source="{StaticResource PhotoIcon.Fullscreen}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="StripExifButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="StripExifButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Exif}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="ConvertToJpgButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="ConvertToJpgButton_Click" Visibility="Collapsed">
+                        <Image Source="{StaticResource PhotoIcon.Convert}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="BatchRenameButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="BatchRenameButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Rename}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="TranslateSettingsButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="TranslateSettingsButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Settings}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    <Button x:Name="DeleteButton" Style="{StaticResource PhotoToolbarIconButtonStyle}" Click="DeleteButton_Click">
+                        <Image Source="{StaticResource PhotoIcon.Delete}" Width="20" Height="20" IsHitTestVisible="False"/>
+                    </Button>
+                    </StackPanel>
+                    </StackPanel>
+                </Viewbox>
+            </Grid>
+        </Border>
     </Grid>
 </UserControl>

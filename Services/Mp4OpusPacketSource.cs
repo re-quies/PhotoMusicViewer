@@ -13,7 +13,7 @@ namespace PhotoMusicViewer.Services
     {
         private readonly FileStream _stream;
         private readonly Mp4OpusIndex _index;
-        private OpusDecoder _decoder = new(48000, 2);
+        private IOpusDecoder _decoder = ManagedOpusDecoderFactory.CreateStereo48k();
         private int _packet;
         private long _skipSamples, _returnedSamples;
         private readonly double _gain;
@@ -30,7 +30,7 @@ namespace PhotoMusicViewer.Services
                 _skipSamples = _index.StartSample;
                 _gain = Math.Pow(10, _index.Gain / (256.0 * 20));
             }
-            catch { _stream.Dispose(); throw; }
+            catch { _decoder.Dispose(); _stream.Dispose(); throw; }
         }
         public byte[]? ReadPacket()
         {
@@ -75,7 +75,11 @@ namespace PhotoMusicViewer.Services
             _skipSamples = target - _index.Starts[_packet];
             _decoder.ResetState();
         }
-        public void Dispose() => _stream.Dispose();
+        public void Dispose()
+        {
+            try { _stream.Dispose(); }
+            finally { _decoder.Dispose(); }
+        }
     }
 
     /// <summary>Строго ограниченный парсер таблиц MP4. Ссылки за mdat, внешние данные,

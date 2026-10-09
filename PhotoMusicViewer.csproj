@@ -9,7 +9,7 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <!-- Номер версии: единственное место. Показывается в настройках («О программе»)
          и в свойствах EXE. Хвост +commit не добавляется, чтобы номер был коротким. -->
-    <Version>7.11.3</Version>
+    <Version>7.13.8</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>PhotoMusicViewer</Product>
 </PropertyGroup>

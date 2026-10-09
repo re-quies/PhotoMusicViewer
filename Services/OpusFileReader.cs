@@ -264,7 +264,7 @@ namespace PhotoMusicViewer.Services
         internal const int PreRollSamples = 3840;
         private readonly FileStream _stream;
         private OggPacketStream _packets;
-        private OpusDecoder _decoder = new(48000, 2);
+        private IOpusDecoder _decoder = ManagedOpusDecoderFactory.CreateStereo48k();
         private long _skipBytes, _returnedBytes;
         private readonly double _gain;
         private readonly OpusContainerInfo _info;
@@ -287,7 +287,7 @@ namespace PhotoMusicViewer.Services
                     throw new InvalidDataException("Invalid Opus header packets.");
                 _gain = Math.Pow(10, BinaryPrimitives.ReadInt16LittleEndian(head.AsSpan(16, 2)) / (256.0 * 20));
             }
-            catch { _stream.Dispose(); throw; }
+            catch { _decoder.Dispose(); _stream.Dispose(); throw; }
         }
         public byte[]? ReadPacket()
         {
@@ -330,12 +330,18 @@ namespace PhotoMusicViewer.Services
             int index = _info.FindSeekPoint(Math.Max(0, target - PreRollSamples));
             _stream.Position = _info.SeekOffsets[index];
             _packets = new OggPacketStream(_stream);
-            _decoder = new OpusDecoder(48000, 2);
+            IOpusDecoder previousDecoder = _decoder;
+            _decoder = ManagedOpusDecoderFactory.CreateStereo48k();
+            previousDecoder.Dispose();
             _skipBytes = checked((target - _info.SeekSamples[index]) * 4L);
             _returnedBytes = pcmBytePosition;
         }
 
-        public void Dispose() => _stream.Dispose();
+        public void Dispose()
+        {
+            try { _stream.Dispose(); }
+            finally { _decoder.Dispose(); }
+        }
     }
 
     /// <summary>Последовательный Ogg без сохранения истории страниц/пакетов.
