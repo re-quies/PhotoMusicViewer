@@ -122,8 +122,6 @@ Output: `app/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/`.
 
 **Distribute the whole publish folder**, not just `PhotoMusicViewer.exe`: `tools/jpegtran/jpegtran.exe` and `libjpeg-62.dll` must remain together beside the app under `tools/jpegtran`, with their license files. “Single-file” does not embed this native helper. The `.csproj` copies it automatically. If the helper is missing or unsupported, affected lossless JPEG operations are refused; there is no silent lossy fallback.
 
-The build-only archive contains `app/`, not the regression suite. Compilation is not a substitute for Windows runtime testing of WPF, Shell, registry transactions, junctions and native JPEG operations.
-
 ### Technology and bundled components
 - C# / .NET 8 / WPF; Windows MediaPlayer and [NAudio](https://github.com/naudio/NAudio) 2.3.0 / NAudio.Vorbis 1.5.0.
 - [Concentus](https://github.com/lostromb/concentus) 2.2.2 / Concentus.Oggfile 1.0.7 for OPUS.
@@ -240,8 +238,6 @@ dotnet publish app/PhotoMusicViewer.csproj -c Release -r win-x64 --self-containe
 
 **Распространяйте всю папку publish**, а не один `PhotoMusicViewer.exe`: `tools/jpegtran/jpegtran.exe` и `libjpeg-62.dll` должны находиться вместе в `tools/jpegtran` рядом с приложением, с файлами лицензий. Параметр single-file не встраивает этот нативный инструмент. `.csproj` копирует его автоматически. При отсутствии инструмента или неподдерживаемой архитектуре соответствующие JPEG-операции без потерь отклоняются, без скрытого перехода к потерям.
 
-Архив только для сборки содержит `app/`, но не регрессионные тесты. Компиляция не заменяет запуск на Windows и проверку WPF, Shell, транзакций реестра, junction и нативных JPEG-операций.
-
 ### Технологии и комплектные компоненты
 - C# / .NET 8 / WPF; Windows MediaPlayer, [NAudio](https://github.com/naudio/NAudio) 2.3.0 / NAudio.Vorbis 1.5.0.
 - [Concentus](https://github.com/lostromb/concentus) 2.2.2 / Concentus.Oggfile 1.0.7 для OPUS.
@@ -357,8 +353,6 @@ dotnet publish app/PhotoMusicViewer.csproj -c Release -r win-x64 --self-containe
 Salida: `app/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/`.
 
 **Distribuye toda la carpeta publish**, no solo `PhotoMusicViewer.exe`: `tools/jpegtran/jpegtran.exe` y `libjpeg-62.dll` deben permanecer juntos en `tools/jpegtran` junto a la aplicación, con sus licencias. Single-file no integra esta herramienta nativa; el `.csproj` la copia automáticamente. Si falta o la arquitectura no se admite, se rechazan las operaciones JPEG sin pérdidas afectadas; no hay conversión con pérdidas silenciosa.
-
-El archivo solo para compilación contiene `app/`, no las pruebas de regresión. Compilar no sustituye las pruebas en Windows de WPF, Shell, transacciones del registro, junctions y operaciones JPEG nativas.
 
 ### Tecnologías y componentes incluidos
 - C# / .NET 8 / WPF; Windows MediaPlayer y [NAudio](https://github.com/naudio/NAudio) 2.3.0 / NAudio.Vorbis 1.5.0.
